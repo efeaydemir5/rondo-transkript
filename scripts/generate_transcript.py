@@ -42,7 +42,7 @@ Lua kullanım örneği:
 from __future__ import annotations
 import sys, json, datetime, pathlib, xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict
+from typing import List, Optional
 
 LETTER_TO_TURKISH = {"C":"Do","D":"Re","E":"Mi","F":"Fa","G":"Sol","A":"La","B":"Si"}
 LETTER_TO_SEMITONE = {"C":0,"D":2,"E":4,"F":5,"G":7,"A":9,"B":11}
@@ -190,7 +190,6 @@ def extract_measures(tree: ET.ElementTree, limit: int=-1) -> List[LinearMeasure]
         except (TypeError, ValueError):
             divisions = 1
 
-        # Directions
         for direction in m.findall(ns.tag('direction')):
             dyn = dynamic_from_direction(direction, ns)
             if dyn:
@@ -201,7 +200,6 @@ def extract_measures(tree: ET.ElementTree, limit: int=-1) -> List[LinearMeasure]
                 current_tempo=tmp
                 lm.tempo=tmp
 
-        # Notes
         for note in m.findall(ns.tag('note')):
             is_rest = note.find(ns.tag('rest')) is not None
             staff_txt = note.findtext(ns.tag('staff'), default='1')
@@ -265,7 +263,6 @@ def extract_measures(tree: ET.ElementTree, limit: int=-1) -> List[LinearMeasure]
                 staff_time_beats[staff]=start_beats+dur_beats
         linear.append(lm)
 
-    # Tie merging
     def merge_ties(events: List[NoteEvent]) -> List[NoteEvent]:
         if not events: return []
         merged=[events[0]]
@@ -309,7 +306,6 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
             })
     events.sort(key=lambda e: (e['t'], e['hand']))
 
-    # TXT
     txt = [
         "Piano Sonata No.11 - Rondo alla Turca (Enhanced Export)",
         f"Generated UTC: {now}",
@@ -323,7 +319,6 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
         txt.append(f"{e['t']:.3f}\t{e['dur']:.3f}\t{e['hand']}\t{','.join(e['pitches_sci']) or 'rest'}\t{e['dyn'] or ''}\t{','.join(e['art'])}")
     (out_dir/"transcript_full.txt").write_text("\n".join(txt), encoding="utf-8")
 
-    # JSON
     json_obj={
         'metadata':{
             'title':'Piano Sonata No.11 - Rondo alla Turca',
@@ -337,21 +332,25 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
     }
     (out_dir/"transcript_full.json").write_text(json.dumps(json_obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # ABC placeholder
     abc_lines=["X:1","T:Rondo alla Turca (Extracted)","M:2/4","L:1/16","Q:1/4=120","K:C","V:1 clef=treble","V:2 clef=bass"]
     (out_dir/"transcript_full.abc").write_text("\n".join(abc_lines), encoding="utf-8")
 
-    # Measure map
     map_lines=["# Measure Map","","| LinearIndex | OriginalMeasure | RH_events | LH_events |","|------------:|---------------:|----------:|----------:|"]
     for m in measures:
         map_lines.append(f"| {m.linear_index} | {m.original_measure} | {len(m.RH)} | {len(m.LH)} |")
     (out_dir/"measure_map.md").write_text("\n".join(map_lines), encoding="utf-8")
 
-    # Lua
     def lua_list(values):
         if not values:
             return "{}"
-        return "{" + ",".join(f"'{{v}}'" if isinstance(v,str) else str(v) for v in values) + "}"
+        formatted=[]
+        for v in values:
+            if isinstance(v,str):
+                formatted.append("'" + v.replace("'","\\'") + "'")
+            else:
+                formatted.append(str(v))
+        return "{" + ",".join(formatted) + "}"
+
     lua_lines=[
         "-- Auto-generated transcription table",
         "return {",
@@ -363,20 +362,9 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
         "  notes = {"
     ]
     for e in events:
+        dyn_field = ("'%s'" % e['dyn']) if e['dyn'] else "nil"
         lua_lines.append(
-            "    {{t=%.6f, dur=%.6f, hand='%s', pitches_sci=%s, pitches_tr=%s, midi=%s, dyn=%s, art=%s, slur_start=%s, slur_end=%s, grace=%s}}," % (
-                e['t'],
-                e['dur'],
-                e['hand'],
-                lua_list(e['pitches_sci']),
-                lua_list(e['pitches_tr']),
-                lua_list(e['midi']),
-                ("'%s" % e['dyn']) if e['dyn'] else "nil",
-                lua_list(e['art']),
-                str(e['slur_start']).lower(),
-                str(e['slur_end']).lower(),
-                str(e['grace']).lower()
-            )
+            f"    {{t={{e['t']:.6f}}, dur={{e['dur']:.6f}}, hand='{{e['hand']}}', pitches_sci={{lua_list(e['pitches_sci'])}}, pitches_tr={{lua_list(e['pitches_tr'])}}, midi={{lua_list(e['midi'])}}, dyn={{dyn_field}}, art={{lua_list(e['art'])}}, slur_start={{str(e['slur_start']).lower()}}, slur_end={{str(e['slur_end']).lower()}}, grace={{str(e['grace']).lower()}}}},"
         )
     lua_lines.append("  }")
     lua_lines.append("}")
