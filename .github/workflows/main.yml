@@ -12,6 +12,9 @@ on:
         required: false
         default: "true"
 
+permissions:
+  contents: write
+
 jobs:
   gen-txt:
     runs-on: ubuntu-latest
@@ -24,35 +27,74 @@ jobs:
         with:
           python-version: "3.x"
 
-      - name: Script çalıştır
+      - name: (Opsiyonel) Bağımlılık yükle
+        if: hashFiles('requirements.txt') != ''
         run: |
-          if [ ! -f "HAHA.musicxml" ]; then
-            echo "HAHA.musicxml bulunamadı (repo köküne ekleyin)." >&2
+          pip install -r requirements.txt
+
+      - name: Yapı / Debug liste
+        run: |
+          set -e
+          echo "Çalışma dizini (pwd):"; pwd
+          echo "--- Root içerik ---"; ls -al
+          echo "--- İlk 3 seviye (script ve xml araması) ---"
+          find . -maxdepth 3 -type f \( -name "generate_transcript.py" -o -name "HAHA.musicxml" \)
+
+      - name: Script çalıştır
+        id: runscript
+        run: |
+          set -euo pipefail
+          echo "Script ve MusicXML otomatik tespiti..."
+          SCRIPT_PATH=$(find . -maxdepth 6 -type f -name "generate_transcript.py" | head -n1 || true)
+          if [ -z "${SCRIPT_PATH}" ]; then
+            echo "HATA: generate_transcript.py bulunamadı. scripts/ klasörünün gerçekten commit edildiğinden emin ol." >&2
             exit 1
           fi
-          python scripts/generate_transcript.py HAHA.musicxml ${{ github.event.inputs.limit }}
+          MUSICXML_PATH=$(find . -maxdepth 6 -type f -name "HAHA.musicxml" | head -n1 || true)
+          if [ -z "${MUSICXML_PATH}" ]; then
+            echo "HATA: HAHA.musicxml bulunamadı (repo köküne ya da alt dizinlerden birine ekleyin)." >&2
+            exit 1
+          fi
+
+          echo "Bulunan script   : ${SCRIPT_PATH}"
+          echo "Bulunan MusicXML : ${MUSICXML_PATH}"
+          echo "Limit            : ${{ github.event.inputs.limit }}"
+
+          python "${SCRIPT_PATH}" "${MUSICXML_PATH}" "${{ github.event.inputs.limit }}"
+
           # Sadece TXT kalsın
-          rm -f transcript_full.json transcript_full.abc measure_map.md || true
-          echo "İlk satırlar:"
-          head -n 15 transcript_full.txt || true
+          rm -f transcript_full.json transcript_full.abc measure_map.md 2>/dev/null || true
+
+          if [ ! -f transcript_full.txt ]; then
+            echo "HATA: transcript_full.txt oluşturulmadı. Script içinde çıktı dosya adı farklı olabilir." >&2
+            exit 2
+          fi
+
+          echo "---- transcript_full.txt (ilk 25 satır) ----"
+          head -n 25 transcript_full.txt || true
+          echo "-------------------------------------------"
 
       - name: Değişiklik kontrol
         id: diffcheck
         run: |
           if [ -n "$(git status --porcelain transcript_full.txt)" ]; then
             echo "changed=true" >> $GITHUB_OUTPUT
+            echo "transcript_full.txt değişmiş."
           else
             echo "changed=false" >> $GITHUB_OUTPUT
+            echo "Değişiklik yok (commit atlanacak)."
           fi
 
       - name: Commit & push
         if: steps.diffcheck.outputs.changed == 'true' && github.event.inputs.commit == 'true'
         run: |
+          set -e
           git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add transcript_full.txt
           git commit -m "chore: auto-generate transcript_full.txt (limit=${{ github.event.inputs.limit }})"
           git push
+          echo "Commit ve push tamam."
 
       - name: Artifact yükle
         uses: actions/upload-artifact@v4
