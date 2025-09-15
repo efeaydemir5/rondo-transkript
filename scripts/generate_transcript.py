@@ -62,7 +62,7 @@ class Articulation:
         if self.marcato: out.append("marcato")
         return out
 
-@dataclass
+dataclass
 class NoteEvent:
     t_beats: float
     t_seconds: float
@@ -306,6 +306,7 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
             })
     events.sort(key=lambda e: (e['t'], e['hand']))
 
+    # TXT
     txt = [
         "Piano Sonata No.11 - Rondo alla Turca (Enhanced Export)",
         f"Generated UTC: {now}",
@@ -319,6 +320,7 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
         txt.append(f"{e['t']:.3f}\t{e['dur']:.3f}\t{e['hand']}\t{','.join(e['pitches_sci']) or 'rest'}\t{e['dyn'] or ''}\t{','.join(e['art'])}")
     (out_dir/"transcript_full.txt").write_text("\n".join(txt), encoding="utf-8")
 
+    # JSON
     json_obj={
         'metadata':{
             'title':'Piano Sonata No.11 - Rondo alla Turca',
@@ -332,14 +334,17 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
     }
     (out_dir/"transcript_full.json").write_text(json.dumps(json_obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    # ABC placeholder
     abc_lines=["X:1","T:Rondo alla Turca (Extracted)","M:2/4","L:1/16","Q:1/4=120","K:C","V:1 clef=treble","V:2 clef=bass"]
     (out_dir/"transcript_full.abc").write_text("\n".join(abc_lines), encoding="utf-8")
 
+    # Measure map
     map_lines=["# Measure Map","","| LinearIndex | OriginalMeasure | RH_events | LH_events |","|------------:|---------------:|----------:|----------:|"]
     for m in measures:
         map_lines.append(f"| {m.linear_index} | {m.original_measure} | {len(m.RH)} | {len(m.LH)} |")
     (out_dir/"measure_map.md").write_text("\n".join(map_lines), encoding="utf-8")
 
+    # Lua exporter
     def lua_list(values):
         if not values:
             return "{}"
@@ -364,10 +369,10 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
     for e in events:
         dyn_field = ("'%s'" % e['dyn']) if e['dyn'] else "nil"
         lua_lines.append(
-            f"    {{t={{e['t']:.6f}}, dur={{e['dur']:.6f}}, hand='{{e['hand']}}', \
-            pitches_sci=lua_list(e['pitches_sci']), pitches_tr=lua_list(e['pitches_tr']), midi=lua_list(e['midi']), \
-            dyn={{dyn_field}}, art=lua_list(e['art']), slur_start={{str(e['slur_start']).lower()}}, \
-            slur_end={{str(e['slur_end']).lower()}}, grace={{str(e['grace']).lower()}}}},"
+            f"    {{t={{e['t']:.6f}}, dur={{e['dur']:.6f}}, hand='{{e['hand']}}', "
+            f"pitches_sci={{lua_list(e['pitches_sci'])}}, pitches_tr={{lua_list(e['pitches_tr'])}}, midi={{lua_list(e['midi'])}}, "
+            f"dyn={{dyn_field}}, art={{lua_list(e['art'])}}, slur_start={{str(e['slur_start']).lower()}}, "
+            f"slur_end={{str(e['slur_end']).lower()}}, grace={{str(e['grace']).lower()}}}},"
         )
     lua_lines.append("  }")
     lua_lines.append("}")
