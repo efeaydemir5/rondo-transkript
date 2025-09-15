@@ -1,0 +1,25 @@
+Piano Sonata No.11 - Rondo alla Turca (PARTIAL 20 measures)
+Generated UTC: 2025-09-15T05:39:22.697242
+Source: HAHA.musicxml
+---
+(This is an automatically generated partial preview. Full features pending.)
+L0(orig m0): RH: Si4-1 La4-1 Sol#4-1 La4-1 | LH: rest-4
+L1(orig m1): RH: Do5-2 rest-2 Re5-1 Do5-1 Si4-1 Do5-1 | LH: La3-2 Do4-2 Mi4-2 Do4-2 Mi4-2 Do4-2 Mi4-2
+L2(orig m2): RH: Mi5-2 rest-2 Fa5-1 Mi5-1 Re#5-1 Mi5-1 | LH: La3-2 Do4-2 Mi4-2 Do4-2 Mi4-2 Do4-2 Mi4-2
+L3(orig m3): RH: Si5-1 La5-1 Sol#5-1 La5-1 Si5-1 La5-1 Sol#5-1 La5-1 | LH: La3-2 Do4-2 Mi4-2 La3-2 Do4-2 Mi4-2
+L4(orig m4): RH: Do6-4 La5-2 Do6-2 | LH: La3-2 Do4-2 Mi4-2 Do4-2 Mi4-2 Do4-2 Mi4-2
+L5(orig m5): RH: {gr: Sol5} {gr: La5} Si5-2 Fa#5-2 La5-2 Mi5-2 Sol5-2 Fa#5-2 La5-2 | LH: Mi3-2 Si3-2 Mi4-2 Si3-2 Mi4-2 Si3-2 Mi4-2
+L6(orig m6): RH: {gr: Sol5} {gr: La5} Si5-2 Fa#5-2 La5-2 Mi5-2 Sol5-2 Fa#5-2 La5-2 | LH: Mi3-2 Si3-2 Mi4-2 Si3-2 Mi4-2 Si3-2 Mi4-2
+L7(orig m7): RH: {gr: Sol5} {gr: La5} Si5-2 Fa#5-2 La5-2 Mi5-2 Sol5-2 Re#5-2 Fa#5-2 | LH: Mi3-2 Si3-2 Mi4-2 Si2-2 Si3-2
+L8(orig m8): RH: Mi5-4 | LH: Mi3-4
+L9(orig m9): RH: Do5-2 Mi5-2 Re5-2 Fa5-2 | LH: rest-4
+L10(orig m10): RH: Mi5-2 Sol5-2 Mi5-2 Sol5-2 La5-1 Sol5-1 Fa5-1 Mi5-1 | LH: Do3-2 Do4-2 Mi3-2 Mi4-2
+L11(orig m11): RH: Re5-4 Do5-2 Mi5-2 Re5-2 Fa5-2 Si4-2 Sol4-2 | LH: Sol3-4 rest-4
+L12(orig m12): RH: Mi5-2 Sol5-2 Mi5-2 Sol5-2 La5-1 Sol5-1 Fa5-1 Mi5-1 | LH: Do3-2 Do4-2 Mi3-2 Mi4-2
+L13(orig m13): RH: Si4-4 Re5-4 La4-2 Do5-2 Si4-2 Re5-2 | LH: Sol3-4 rest-4
+L14(orig m14): RH: Do5-2 Mi5-2 Do5-2 Mi5-2 Fa5-1 Mi5-1 Re5-1 Do5-1 | LH: La2-2 La3-2 Do3-2 Do4-2
+L15(orig m15): RH: Si4-4 La4-2 Do5-2 Si4-2 Re5-2 Sol#4-2 Mi4-2 | LH: Mi3-4 rest-4
+L16(orig m16): RH: Do5-2 Mi5-2 Do5-2 Mi5-2 Fa5-1 Mi5-1 Re5-1 Do5-1 | LH: La2-2 La3-2 Do3-2 Do4-2
+L17(orig m17): RH: Sol#4-4 Si4-4 Si4-1 La4-1 Sol#4-1 La4-1 | LH: Mi3-4 rest-4
+L18(orig m18): RH: Do5-2 rest-2 Re5-1 Do5-1 Si4-1 Do5-1 | LH: La3-2 Do4-2 Mi4-2 Do4-2 Mi4-2 Do4-2 Mi4-2
+L19(orig m19): RH: Mi5-2 rest-2 Fa5-1 Mi5-1 Re#5-1 Mi5-1 | LH: La3-2 Do4-2 Mi4-2 Do4-2 Mi4-2 Do4-2 Mi4-2
