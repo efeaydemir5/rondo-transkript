@@ -38,7 +38,7 @@ import sys, json, datetime, pathlib, xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-__VERSION__ = "0.3.2"
+__VERSION__ = "0.3.3"
 
 LETTER_TO_TURKISH = {"C":"Do","D":"Re","E":"Mi","F":"Fa","G":"Sol","A":"La","B":"Si"}
 LETTER_TO_SEMITONE = {"C":0,"D":2,"E":4,"F":5,"G":7,"A":9,"B":11}
@@ -58,7 +58,7 @@ class Articulation:
         if self.marcato: out.append("marcato")
         return out
 
-dataclass
+@dataclass
 class NoteEvent:
     t_beats: float
     t_seconds: float
@@ -74,7 +74,7 @@ class NoteEvent:
     grace: bool=False
     hand: str="RH"
 
-dataclass
+@dataclass
 class LinearMeasure:
     linear_index: int
     original_measure: int
@@ -335,67 +335,4 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
     (out_dir/"transcript_full.abc").write_text("\n".join(abc_lines), encoding="utf-8")
 
     # Measure map
-    map_lines=["# Measure Map","","| LinearIndex | OriginalMeasure | RH_events | LH_events |","|------------:|---------------:|----------:|----------:|"]
-    for m in measures:
-        map_lines.append(f"| {m.linear_index} | {m.original_measure} | {len(m.RH)} | {len(m.LH)} |")
-    (out_dir/"measure_map.md").write_text("\n".join(map_lines), encoding="utf-8")
-
-    # Lua exporter helpers
-    def lua_list(values):
-        if not values:
-            return "{}"
-        formatted=[]
-        for v in values:
-            if isinstance(v,str):
-                formatted.append("'" + v.replace("'", "\\'") + "'")
-            else:
-                formatted.append(str(v))
-        return "{" + ",".join(formatted) + "}"
-
-    lua_lines=[
-        "-- Auto-generated transcription table",
-        f"-- Generated UTC: {now}",
-        f"-- Script version: {__VERSION__}",
-        "return {",
-        "  metadata = {",
-        "    title = 'Piano Sonata No.11 - Rondo alla Turca',",
-        f"    generated_utc = '{now}',",
-        f"    event_count = {len(events)},",
-        f"    script_version = '{__VERSION__}',",
-        "  },",
-        "  notes = {"
-    ]
-    for e in events:
-        dyn_field = ("'%s'" % e['dyn']) if e['dyn'] else "nil"
-        lua_lines.append(
-            f"    {{t={{e['t']:.6f}}, dur={{e['dur']:.6f}}, hand='{{e['hand']}}', \
-            pitches_sci={{lua_list(e['pitches_sci'])}}, pitches_tr={{lua_list(e['pitches_tr'])}}, midi={{lua_list(e['midi'])}}, \
-            dyn={{dyn_field}}, art={{lua_list(e['art'])}}, slur_start={{'true' if e['slur_start'] else 'false'}}, \
-            slur_end={{'true' if e['slur_end'] else 'false'}}, grace={{'true' if e['grace'] else 'false'}}}}},"
-        )
-    lua_lines.append("  }")
-    lua_lines.append("}")
-    (out_dir/"transcript_full.lua").write_text("\n".join(lua_lines), encoding="utf-8")
-
-    print(f"Wrote {len(events)} events across {len(measures)} measures.")
-
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: generate_transcript.py HAHA.musicxml [LIMIT]", file=sys.stderr)
-        sys.exit(1)
-    path = pathlib.Path(sys.argv[1])
-    if not path.exists():
-        print(f"MusicXML not found: {path}", file=sys.stderr)
-        sys.exit(2)
-    if len(sys.argv) > 2:
-        raw_limit = sys.argv[2]
-        limit = -1 if raw_limit.lower() in ('-1','all') else int(raw_limit)
-    else:
-        limit = -1
-
-    tree = parse_musicxml(path)
-    measures = extract_measures(tree, limit=limit)
-    write_outputs(measures, pathlib.Path('.'))
-
-if __name__ == '__main__':
-    main()
+    map_lines=["# Measure Map","",
