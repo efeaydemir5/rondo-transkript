@@ -1,43 +1,51 @@
 #!/usr/bin/env python3
-"""Enhanced MusicXML -> transcript & Lua exporter.
+"""
+Enhanced MusicXML -> multi-format transcript & Roblox Lua exporter.
 
-Features added:
- - Full piece extraction (use limit=-1 or omit for all measures)
- - Tie merging (durations of tied notes combined)
- - Dynamics parsing (p, mp, mf, f, ff, etc.)
+Features:
+ - Full piece extraction (limit = -1 or 'all')
+ - Basic forward/backward repeat expansion (single-level)
+ - Tie merging (contiguous same pitch)
+ - Dynamics parsing (ppp..fff, sfz, fp)
  - Articulations (staccato, accent, tenuto, marcato)
- - Slur start / end flags
- - Tempo changes (basic support via <sound tempo=''>) applied at note onset
+ - Slur start/end flags
+ - Tempo changes via <sound tempo="">
+ - Grace notes (dur=0, zaman ilerletmez)
  - Outputs:
-     * transcript_full.txt  (human-readable summary)
-     * transcript_full.json (structured events)
-     * transcript_full.abc  (very rough placeholder)
-     * measure_map.md       (measure mapping table)
-     * transcript_full.lua  (Lua table ready for Roblox scripting)
- - Turkish pitch names retained, plus MIDI number & scientific pitch
+     * transcript_full.txt
+     * transcript_full.json
+     * transcript_full.abc (placeholder)
+     * measure_map.md
+     * transcript_full.lua (Roblox friendly)
+
+Pitch data:
+ - Turkish pitch adları (Do,Re...) + alter (#/b) + oktav
+ - Scientific pitch (C#4, Eb5 ...)
+ - MIDI numaraları
 
 Limitations / TODO:
- - Repeat & ending expansion is still basic: handles simple forward/backward repeats once, ignores complex nested endings.
- - Grace notes: kept with dur=0 (not inserted into timing advance).
- - Multiple voices on same staff merged in insertion order.
+ - Çok karmaşık tekrar/ending/DC/segno senaryoları yok
+ - Çoklu voice birleşimi basit sırada
+ - Pedal / crescendo / lyrics yok
+ - Bir ölçü içinde değişen divisions (nadir) yeniden hesaplanmıyor
 
 Usage:
     python scripts/generate_transcript.py HAHA.musicxml [LIMIT]
-Where LIMIT is integer number of linear measures after (optional) repeat expansion, or -1 / 'all' for full piece.
+Where LIMIT integer veya -1 / all.
 
-Roblox Lua usage idea:
-    local score = require(path_to_module).notes
-    -- Each entry: {t=seconds, dur=seconds, hand='RH'|'LH', pitches={'C4',...}, midi={60,...}, dyn='mf', art={...}}
-
+Lua kullanım örneği:
+    local score = require(path_to_module)
+    for _, ev in ipairs(score.notes) do
+        -- ev.t, ev.dur, ev.pitches_sci, ev.midi ...
+    end
 """
 from __future__ import annotations
 import sys, json, datetime, pathlib, xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict
 
-# --- Pitch / Music helpers --------------------------------------------------
 LETTER_TO_TURKISH = {"C":"Do","D":"Re","E":"Mi","F":"Fa","G":"Sol","A":"La","B":"Si"}
-LETTER_TO_SEMITONE = {"C":0, "D":2, "E":4, "F":5, "G":7, "A":9, "B":11}
+LETTER_TO_SEMITONE = {"C":0,"D":2,"E":4,"F":5,"G":7,"A":9,"B":11}
 DYNAMIC_TAGS = ["ppp","pp","p","mp","mf","f","ff","fff","fp","sfz"]
 
 dataclass
@@ -46,7 +54,6 @@ class Articulation:
     accent: bool=False
     tenuto: bool=False
     marcato: bool=False
-
     def tokens(self) -> List[str]:
         out=[]
         if self.staccato: out.append("staccato")
@@ -61,8 +68,8 @@ class NoteEvent:
     t_seconds: float
     dur_beats: float
     dur_seconds: float
-    pitches: List[str]             # Turkish names (Do4, etc.)
-    sci: List[str]                 # Scientific pitch (C#4)
+    pitches_tr: List[str]
+    pitches_sci: List[str]
     midi: List[int]
     dyn: Optional[str]=None
     art: List[str]=field(default_factory=list)
@@ -80,26 +87,6 @@ class LinearMeasure:
     tempo: Optional[float]=None
     new_dynamic: Optional[str]=None
 
-# ---------------------------------------------------------------------------
-
-def midi_number(step: str, alter: int, octave: int) -> int:
-    return (octave + 1)*12 + LETTER_TO_SEMITONE[step] + alter
-
-def sci_name(step: str, alter: int, octave: int) -> str:
-    accidental = {1:'♯', -1:'♭'}.get(alter,'')
-    # Use #/b ASCII for Roblox compatibility
-    accidental_ascii = {1:'#', -1:'b'}.get(alter,'')
-    return f"{step}{accidental_ascii}{octave}"
-
-def turkish_name(step: str, alter: int, octave: int) -> str:
-    base = LETTER_TO_TURKISH[step]
-    if alter == 1:
-        base += '#'
-    elif alter == -1:
-        base += 'b'
-    return f"{base}{octave}"
-
-# Namespace helper
 class NS:
     def __init__(self, root: ET.Element):
         if root.tag.startswith('{'):
@@ -109,17 +96,21 @@ class NS:
     def tag(self, local: str) -> str:
         return f"{{{self.ns}}}{local}" if self.ns else local
 
-# Repeat handling (very basic)
-dataclass
-class RepeatInfo:
-    forward_index: int
-    backward_index: int
+def midi_number(step: str, alter: int, octave: int) -> int:
+    return (octave + 1)*12 + LETTER_TO_SEMITONE[step] + alter
 
-# ---------------------------------------------------------------------------
+def sci_name(step: str, alter: int, octave: int) -> str:
+    acc = {1:'#', -1:'b'}.get(alter,'')
+    return f"{step}{acc}{octave}"
+
+def turkish_name(step: str, alter: int, octave: int) -> str:
+    base = LETTER_TO_TURKISH[step]
+    if alter == 1: base += '#'
+    elif alter == -1: base += 'b'
+    return f"{base}{octave}"
 
 def parse_musicxml(path: pathlib.Path) -> ET.ElementTree:
     return ET.parse(path)
-
 
 def collect_measures(root: ET.Element) -> List[ET.Element]:
     ns = NS(root)
@@ -128,46 +119,41 @@ def collect_measures(root: ET.Element) -> List[ET.Element]:
         return []
     return list(part.findall(ns.tag('measure')))
 
-
 def expand_repeats_basic(measures: List[ET.Element]) -> List[ET.Element]:
-    # Handles single level forward/backward repeat marks (direction="forward"/"backward") once.
-    ns = NS(measures[0]) if measures else None
-    forward_stack = []
-    expanded = []
-    i=0
+    if not measures:
+        return []
+    ns = NS(measures[0])
+    forward_stack=[]
+    expanded=[]
     used_backward=set()
+    i=0
     while i < len(measures):
-        m = measures[i]
+        m=measures[i]
         expanded.append(m)
-        # Detect repeat signs
-        for barline in m.findall('.//'+(ns.tag('barline') if ns else 'barline')):
-            repeat = barline.find((ns.tag('repeat') if ns else 'repeat'))
+        for barline in m.findall('.//'+ns.tag('barline')):
+            repeat = barline.find(ns.tag('repeat'))
             if repeat is not None:
                 direction = repeat.get('direction')
                 if direction == 'forward':
                     forward_stack.append(i)
                 elif direction == 'backward' and forward_stack:
-                    if i not in used_backward:  # do only once
+                    if i not in used_backward:
                         start = forward_stack.pop()
-                        segment = measures[start:i+1]
-                        expanded.extend(segment)  # second pass
+                        seg = measures[start:i+1]
+                        expanded.extend(seg)
                         used_backward.add(i)
-        i += 1
+        i+=1
     return expanded
 
-
 def dynamic_from_direction(direction_el: ET.Element, ns: NS) -> Optional[str]:
-    dyns = direction_el.find(ns.tag('direction-type')) if direction_el is not None else None
-    if dyns is None:
-        return None
+    dtyp = direction_el.find(ns.tag('direction-type')) if direction_el is not None else None
+    if dtyp is None: return None
     for dtag in DYNAMIC_TAGS:
-        if dyns.find(ns.tag(dtag)) is not None:
+        if dtyp.find(ns.tag(dtag)) is not None:
             return dtag
     return None
 
-
 def tempo_from_direction(direction_el: ET.Element, ns: NS) -> Optional[float]:
-    # <sound tempo="120"/>
     sound = direction_el.find(ns.tag('sound')) if direction_el is not None else None
     if sound is not None and sound.get('tempo'):
         try:
@@ -176,45 +162,53 @@ def tempo_from_direction(direction_el: ET.Element, ns: NS) -> Optional[float]:
             return None
     return None
 
-
 def extract_measures(tree: ET.ElementTree, limit: int=-1) -> List[LinearMeasure]:
     root = tree.getroot()
     ns = NS(root)
-    raw_measures = collect_measures(root)
-    expanded = expand_repeats_basic(raw_measures)
+    raw = collect_measures(root)
+    expanded = expand_repeats_basic(raw)
     if limit not in (-1, None) and limit >= 0:
         expanded = expanded[:limit]
+
     linear: List[LinearMeasure] = []
-
-    current_dynamic = None
-    current_tempo = 120.0
-
-    # For timing we track per staff accumulated beats.
-    staff_time_beats = {1:0.0, 2:0.0}
+    current_dynamic=None
+    current_tempo=120.0
+    staff_time_beats={1:0.0, 2:0.0}
 
     for lin_idx, m in enumerate(expanded):
-        meas_no = int(m.get('number','0'))
+        no_txt = m.get('number','0')
+        try:
+            meas_no = int(no_txt)
+        except ValueError:
+            meas_no = 0
         lm = LinearMeasure(linear_index=lin_idx, original_measure=meas_no)
-        # divisions for this measure
-        div_el = m.find(ns.tag('attributes')+'/'+ns.tag('divisions')) if m.find(ns.tag('attributes')) is not None else None
-        divisions = int(div_el.text) if div_el is not None else 1
 
-        # Directions (dynamics / tempo / slurs?)
+        attr = m.find(ns.tag('attributes'))
+        div_el = attr.find(ns.tag('divisions')) if attr is not None else None
+        try:
+            divisions = int(div_el.text) if div_el is not None else 1
+        except (TypeError, ValueError):
+            divisions = 1
+
+        # Directions
         for direction in m.findall(ns.tag('direction')):
             dyn = dynamic_from_direction(direction, ns)
             if dyn:
-                current_dynamic = dyn
-                lm.new_dynamic = dyn
+                current_dynamic=dyn
+                lm.new_dynamic=dyn
             tmp = tempo_from_direction(direction, ns)
             if tmp:
-                current_tempo = tmp
-                lm.tempo = tmp
+                current_tempo=tmp
+                lm.tempo=tmp
 
-        # Process notes
+        # Notes
         for note in m.findall(ns.tag('note')):
             is_rest = note.find(ns.tag('rest')) is not None
-            staff = int(note.findtext(ns.tag('staff'), default='1'))
-            voice = note.findtext(ns.tag('voice'))  # unused currently
+            staff_txt = note.findtext(ns.tag('staff'), default='1')
+            try:
+                staff = int(staff_txt)
+            except ValueError:
+                staff = 1
             duration_div = note.findtext(ns.tag('duration'))
             grace = note.find(ns.tag('grace')) is not None
 
@@ -222,69 +216,62 @@ def extract_measures(tree: ET.ElementTree, limit: int=-1) -> List[LinearMeasure]
             alter = int(note.findtext(ns.tag('pitch')+'/'+ns.tag('alter'), default='0')) if step else 0
             octave = int(note.findtext(ns.tag('pitch')+'/'+ns.tag('octave'))) if step else 0
 
-            # Convert duration: duration_divisions / divisions = quarter notes
-            if grace or not duration_div:
-                dur_quarter = 0.0
+            if grace or not duration_div or not duration_div.isdigit():
+                dur_quarter=0.0
             else:
-                dur_quarter = int(duration_div)/divisions
-            dur_beats = dur_quarter  # treat quarter note = 1 beat
+                dur_quarter=int(duration_div)/divisions
+            dur_beats=dur_quarter
 
-            # Start times (grace notes share time with following => do not advance before)
-            start_beats = staff_time_beats[staff]
-            start_seconds = (60.0/current_tempo) * start_beats
+            start_beats=staff_time_beats.get(staff,0.0)
+            start_seconds=(60.0/current_tempo)*start_beats
 
-            # Build pitch lists
-            turkish_list=[]; sci_list=[]; midi_list=[]
+            pitches_tr=[]; pitches_sci=[]; midi=[]
             if not is_rest:
-                turkish_list.append(turkish_name(step, alter, octave))
-                sci_list.append(sci_name(step, alter, octave))
-                midi_list.append(midi_number(step, alter, octave))
+                pitches_tr.append(turkish_name(step, alter, octave))
+                pitches_sci.append(sci_name(step, alter, octave))
+                midi.append(midi_number(step, alter, octave))
 
-            # Articulations
             articulation = Articulation(
                 staccato = note.find('.//'+ns.tag('staccato')) is not None,
                 accent   = note.find('.//'+ns.tag('accent')) is not None,
                 tenuto   = note.find('.//'+ns.tag('tenuto')) is not None,
                 marcato  = note.find('.//'+ns.tag('strong-accent')) is not None,
             )
-
-            # Slurs
-            slur_start = False; slur_end = False
+            slur_start=False; slur_end=False
             for sl in note.findall('.//'+ns.tag('slur')):
-                stype = sl.get('type')
-                if stype == 'start': slur_start = True
-                elif stype == 'stop': slur_end = True
+                t = sl.get('type')
+                if t=='start': slur_start=True
+                elif t=='stop': slur_end=True
 
             ev = NoteEvent(
                 t_beats=start_beats,
                 t_seconds=start_seconds,
                 dur_beats=dur_beats,
                 dur_seconds=(60.0/current_tempo)*dur_beats,
-                pitches=turkish_list,
-                sci=sci_list,
-                midi=midi_list,
+                pitches_tr=pitches_tr,
+                pitches_sci=pitches_sci,
+                midi=midi,
                 dyn=current_dynamic,
                 art=articulation.tokens(),
                 slur_start=slur_start,
                 slur_end=slur_end,
                 grace=grace,
-                hand='RH' if staff == 1 else 'LH'
+                hand='RH' if staff==1 else 'LH'
             )
-            target = lm.RH if staff == 1 else lm.LH
+            target = lm.RH if staff==1 else lm.LH
             target.append(ev)
 
             if not grace:
-                staff_time_beats[staff] += dur_beats
+                staff_time_beats[staff]=start_beats+dur_beats
         linear.append(lm)
 
-    # Tie merging (simple): merge consecutive notes with same first midi in same hand & beat continuity with zero gap.
+    # Tie merging
     def merge_ties(events: List[NoteEvent]) -> List[NoteEvent]:
         if not events: return []
         merged=[events[0]]
         for ev in events[1:]:
-            last = merged[-1]
-            if last.midi and ev.midi and last.midi==ev.midi and abs((last.t_beats+last.dur_beats)-ev.t_beats) < 1e-9:
-                # merge
+            last=merged[-1]
+            if last.midi and ev.midi and last.midi == ev.midi and abs((last.t_beats+last.dur_beats)-ev.t_beats) < 1e-9:
                 last.dur_beats += ev.dur_beats
                 last.dur_seconds += ev.dur_seconds
                 last.slur_end = last.slur_end or ev.slur_end
@@ -298,24 +285,21 @@ def extract_measures(tree: ET.ElementTree, limit: int=-1) -> List[LinearMeasure]
 
     return linear
 
-# ---------------------------------------------------------------------------
-
 def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
     out_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.datetime.utcnow().isoformat()
 
-    # Flatten events for JSON & Lua
-    all_events: List[Dict] = []
+    events=[]
     for m in measures:
         for ev in m.RH + m.LH:
-            all_events.append({
+            events.append({
                 't': round(ev.t_seconds,6),
                 'dur': round(ev.dur_seconds,6),
                 'beats': round(ev.t_beats,6),
                 'dur_beats': round(ev.dur_beats,6),
                 'hand': ev.hand,
-                'pitches_tr': ev.pitches,
-                'pitches_sci': ev.sci,
+                'pitches_tr': ev.pitches_tr,
+                'pitches_sci': ev.pitches_sci,
                 'midi': ev.midi,
                 'dyn': ev.dyn,
                 'art': ev.art,
@@ -323,65 +307,82 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
                 'slur_end': ev.slur_end,
                 'grace': ev.grace,
             })
-    # Sort by absolute time then hand
-    all_events.sort(key=lambda e: (e['t'], e['hand']))
+    events.sort(key=lambda e: (e['t'], e['hand']))
 
     # TXT
-    txt_lines = [
-        "Piano Sonata No.11 - Rondo alla Turca (FULL / Enhanced Export)",
+    txt = [
+        "Piano Sonata No.11 - Rondo alla Turca (Enhanced Export)",
         f"Generated UTC: {now}",
         "Source: HAHA.musicxml",
         f"Linear measures: {len(measures)}",
-        f"Events: {len(all_events)}",
+        f"Events: {len(events)}",
         "---",
-        "Columns: time_sec | dur_sec | hand | pitches_sci | dyn | art"
+        "time_sec\tdur_sec\thand\tpitches_sci\tdyn\tart"
     ]
-    for e in all_events[:1000]:  # safeguard if extremely large
-        txt_lines.append(f"{e['t']:.3f}\t{e['dur']:.3f}\t{e['hand']}\t{','.join(e['pitches_sci']) or 'rest'}\t{e['dyn'] or ''}\t{','.join(e['art'])}")
-    (out_dir/"transcript_full.txt").write_text("\n".join(txt_lines), encoding='utf-8')
+    for e in events[:2000]:
+        txt.append(f"{e['t']:.3f}\t{e['dur']:.3f}\t{e['hand']}\t{','.join(e['pitches_sci']) or 'rest'}\t{e['dyn'] or ''}\t{','.join(e['art'])}")
+    (out_dir/"transcript_full.txt").write_text("\n".join(txt), encoding="utf-8")
 
     # JSON
-    json_obj = {
-        'metadata': {
-            'title': 'Piano Sonata No.11 - Rondo alla Turca',
-            'source_file': 'HAHA.musicxml',
-            'generated_utc': now,
-            'measure_count': len(measures),
-            'event_count': len(all_events),
-            'format_version': 2
+    json_obj={
+        'metadata':{
+            'title':'Piano Sonata No.11 - Rondo alla Turca',
+            'source_file':'HAHA.musicxml',
+            'generated_utc':now,
+            'measure_count':len(measures),
+            'event_count':len(events),
+            'format_version':3
         },
-        'events': all_events
+        'events':events
     }
-    (out_dir/"transcript_full.json").write_text(json.dumps(json_obj, ensure_ascii=False, indent=2), encoding='utf-8')
+    (out_dir/"transcript_full.json").write_text(json.dumps(json_obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # Minimal ABC placeholder (unchanged idea)
-    abc_lines = ["X:1","T:Rondo alla Turca (Extracted)","M:2/4","L:1/16","Q:1/4=120","K:C","V:1 clef=treble","V:2 clef=bass"]
-    (out_dir/"transcript_full.abc").write_text("\n".join(abc_lines), encoding='utf-8')
+    # ABC placeholder
+    abc_lines=["X:1","T:Rondo alla Turca (Extracted)","M:2/4","L:1/16","Q:1/4=120","K:C","V:1 clef=treble","V:2 clef=bass"]
+    (out_dir/"transcript_full.abc").write_text("\n".join(abc_lines), encoding="utf-8")
 
     # Measure map
-    map_lines = ["# Measure Map","","| LinearIndex | OriginalMeasure | RH_events | LH_events |","|------------:|---------------:|----------:|----------:|"]
+    map_lines=["# Measure Map","","| LinearIndex | OriginalMeasure | RH_events | LH_events |","|------------:|---------------:|----------:|----------:|"]
     for m in measures:
         map_lines.append(f"| {m.linear_index} | {m.original_measure} | {len(m.RH)} | {len(m.LH)} |")
-    (out_dir/"measure_map.md").write_text("\n".join(map_lines), encoding='utf-8')
+    (out_dir/"measure_map.md").write_text("\n".join(map_lines), encoding="utf-8")
 
-    # Lua export
-    lua_lines = ["-- Auto-generated transcription table","return {","  metadata = {",f"    title = 'Piano Sonata No.11 - Rondo alla Turca',",f"    generated_utc = '{now}',",f"    event_count = {len(all_events)},", "  },","  notes = {"
-    for e in all_events:
+    # Lua
+    def lua_list(values):
+        if not values:
+            return "{}"
+        return "{" + ",".join(f"'{{v}}'" if isinstance(v,str) else str(v) for v in values) + "}"
+    lua_lines=[
+        "-- Auto-generated transcription table",
+        "return {",
+        "  metadata = {",
+        "    title = 'Piano Sonata No.11 - Rondo alla Turca',",
+        f"    generated_utc = '{now}',",
+        f"    event_count = {len(events)},",
+        "  },",
+        "  notes = {"
+    ]
+    for e in events:
         lua_lines.append(
-            "    {t="+f"{e['t']:.6f}, dur={e['dur']:.6f}, hand='{e['hand']}', pitches={{{}}}, midi={{{}}}, dyn='{dyn}', art={{{}}}, grace={{g}}".format(
-                ','.join(e['pitches_sci']),
-                ','.join(str(m) for m in e['midi']),
-                dyn=(e['dyn'] or ''),
-                g='true' if e['grace'] else 'false',
-                art=','.join("'"+a+"'" for a in e['art'])
-            ).replace('dyn=''','dyn=nil')
+            "    {{t=%.6f, dur=%.6f, hand='%s', pitches_sci=%s, pitches_tr=%s, midi=%s, dyn=%s, art=%s, slur_start=%s, slur_end=%s, grace=%s}}," % (
+                e['t'],
+                e['dur'],
+                e['hand'],
+                lua_list(e['pitches_sci']),
+                lua_list(e['pitches_tr']),
+                lua_list(e['midi']),
+                ("'%s" % e['dyn']) if e['dyn'] else "nil",
+                lua_list(e['art']),
+                str(e['slur_start']).lower(),
+                str(e['slur_end']).lower(),
+                str(e['grace']).lower()
+            )
         )
-    lua_lines.append("  }","}")
-    (out_dir/"transcript_full.lua").write_text("\n".join(lua_lines), encoding='utf-8')
+    lua_lines.append("  }")
+    lua_lines.append("}")
+    (out_dir/"transcript_full.lua").write_text("\n".join(lua_lines), encoding="utf-8")
 
-    print(f"Wrote {len(all_events)} events across {len(measures)} measures.")
-
-# ---------------------------------------------------------------------------
+    print(f"Wrote {len(events)} events across {len(measures)} measures.")
 
 def main():
     if len(sys.argv) < 2:
@@ -393,9 +394,10 @@ def main():
         sys.exit(2)
     if len(sys.argv) > 2:
         raw_limit = sys.argv[2]
-        limit = -1 if raw_limit in ('-1','all','ALL') else int(raw_limit)
+        limit = -1 if raw_limit.lower() in ('-1','all') else int(raw_limit)
     else:
         limit = -1
+
     tree = parse_musicxml(path)
     measures = extract_measures(tree, limit=limit)
     write_outputs(measures, pathlib.Path('.'))
