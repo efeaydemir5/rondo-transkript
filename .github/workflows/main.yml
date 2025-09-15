@@ -1,0 +1,62 @@
+name: Generate Transcript TXT Only
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Ölçü limiti (varsayılan 20)"
+        required: false
+        default: "20"
+      commit:
+        description: "Değişiklikleri commit et (true/false)"
+        required: false
+        default: "true"
+
+jobs:
+  gen-txt:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Script çalıştır
+        run: |
+          if [ ! -f "HAHA.musicxml" ]; then
+            echo "HAHA.musicxml bulunamadı (repo köküne ekleyin)." >&2
+            exit 1
+          fi
+          python scripts/generate_transcript.py HAHA.musicxml ${{ github.event.inputs.limit }}
+          # Sadece TXT kalsın
+          rm -f transcript_full.json transcript_full.abc measure_map.md || true
+          echo "İlk satırlar:"
+          head -n 15 transcript_full.txt || true
+
+      - name: Değişiklik kontrol
+        id: diffcheck
+        run: |
+          if [ -n "$(git status --porcelain transcript_full.txt)" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit & push
+        if: steps.diffcheck.outputs.changed == 'true' && github.event.inputs.commit == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add transcript_full.txt
+          git commit -m "chore: auto-generate transcript_full.txt (limit=${{ github.event.inputs.limit }})"
+          git push
+
+      - name: Artifact yükle
+        uses: actions/upload-artifact@v4
+        with:
+          name: transcript_txt
+          path: transcript_full.txt
+          if-no-files-found: error
