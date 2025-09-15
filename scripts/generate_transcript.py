@@ -38,6 +38,8 @@ import sys, json, datetime, pathlib, xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+__VERSION__ = "0.3.1"
+
 LETTER_TO_TURKISH = {"C":"Do","D":"Re","E":"Mi","F":"Fa","G":"Sol","A":"La","B":"Si"}
 LETTER_TO_SEMITONE = {"C":0,"D":2,"E":4,"F":5,"G":7,"A":9,"B":11}
 DYNAMIC_TAGS = ["ppp","pp","p","mp","mf","f","ff","fff","fp","sfz"]
@@ -358,10 +360,10 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
     for e in events:
         dyn_field = ("'%s'" % e['dyn']) if e['dyn'] else "nil"
         lua_lines.append(
-            f"    {{t={{e['t']:.6f}}, dur={{e['dur']:.6f}}, hand='{{e['hand']}}', "
-            f"pitches_sci=lua_list(e['pitches_sci']), pitches_tr=lua_list(e['pitches_tr']), midi=lua_list(e['midi']), "
-            f"dyn={dyn_field}, art=lua_list(e['art']), slur_start={{str(e['slur_start']).lower()}}, "
-            f"slur_end={{str(e['slur_end']).lower()}}, grace={{str(e['grace']).lower()}}}}},"
+            f"    {{t={e['t']:.6f}, dur={e['dur']:.6f}, hand='{e['hand']}', "
+            f"pitches_sci={lua_list(e['pitches_sci'])}, pitches_tr={lua_list(e['pitches_tr'])}, midi={lua_list(e['midi'])}, "
+            f"dyn={dyn_field}, art={lua_list(e['art'])}, slur_start={str(e['slur_start']).lower()}, "
+            f"slur_end={str(e['slur_end']).lower()}, grace={str(e['grace']).lower()}}},"
         )
     lua_lines.append("  }")
     lua_lines.append("}")
