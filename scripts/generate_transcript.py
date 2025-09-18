@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 MusicXML'den SADECE sağ el (RH, staff=1) notalarını çıkaran,
-repeat işaretlerini açan, müziğin gerçek akışını eksiksiz veren transcript scripti.
+repeat işaretlerini açan, müziğin gerçek çalınış sırasını eksiksiz veren transcript scripti.
 USAGE:
     python scripts/generate_transcript.py <input.musicxml>
 """
+
 import sys
 import json
 import datetime
@@ -13,7 +14,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-__VERSION__ = "0.5.0"
+__VERSION__ = "0.5.1"
 
 LETTER_TO_TURKISH = {"C": "Do", "D": "Re", "E": "Mi", "F": "Fa", "G": "Sol", "A": "La", "B": "Si"}
 LETTER_TO_SEMITONE = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
@@ -96,7 +97,7 @@ def expand_repeats_basic(measures: List[ET.Element]) -> List[ET.Element]:
     expanded = []
     i = 0
     forward_stack = []
-    repeat_map = {}  # i: kaç defa tekrar edildi
+    repeat_count_map = {}  # i: kaç defa tekrar edildi
     while i < len(measures):
         m = measures[i]
         expanded.append(m)
@@ -108,16 +109,16 @@ def expand_repeats_basic(measures: List[ET.Element]) -> List[ET.Element]:
                 if direction == 'forward':
                     forward_stack.append(i)
                 elif direction == 'backward' and forward_stack:
-                    start = forward_stack.pop()
-                    # 2. defa tekrar etme kontrolü (MusicXML'de times varsa)
+                    start = forward_stack[-1]
+                    # times özniteliği varsa (örn. 3x tekrar), ona göre aç
                     times = repeat.get('times')
                     times = int(times) if times and times.isdigit() else 2
-                    count = repeat_map.get(i, 1)
+                    count = repeat_count_map.get((start, i), 1)
                     if count < times:
-                        repeat_map[i] = count + 1
+                        repeat_count_map[(start, i)] = count + 1
                         i = start - 1  # tekrar başına gönder
                         repeat_found = True
-        # Bu ölçüde D.C./Dal Segno gibi gelişmiş yönlendirme varsa uyarı ver
+        # Karmaşık tekrar için uyarı
         for sound in m.findall('.//'+ns.tag('sound')):
             if sound.get('dalsegno') or sound.get('dacapo') or sound.get('fine'):
                 print(f"UYARI: Karmaşık tekrar (DC/segno/fine) algılandı; script sadece basit repeat açar!", file=sys.stderr)
@@ -128,7 +129,6 @@ def expand_repeats_basic(measures: List[ET.Element]) -> List[ET.Element]:
 def extract_measures(tree: ET.ElementTree) -> List[LinearMeasure]:
     root = tree.getroot()
     ns = NS(root)
-    # Tüm ölçüleri, repeat açarak sıradaki gibi çıkar
     raw = collect_measures(root)
     expanded = expand_repeats_basic(raw)
 
