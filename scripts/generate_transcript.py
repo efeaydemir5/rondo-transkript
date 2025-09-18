@@ -4,35 +4,40 @@ MusicXML'den SADECE sağ el (RH, staff=1) notalarını çıkaran,
 eşleştirilmiş repeat (|: :|) + volta (1.,2. ending) + D.C./D.S./To Coda/Fine
 işaretlerini deterministik şekilde uygulayan transcript scripti.
 
-- Repeat eşleştirme ön taramada yapılır; eşleşmeyen forward yok sayılır.
-- Volta (ending) pas numarasına göre doğru atlanır.
-- D.C., D.S., To Coda ve Fine uygulanır:
-  - D.C./D.S. her biri en fazla 1 kez uygulanır.
-  - To Coda yalnızca D.C./D.S. dönüşünden sonra 1 kez uygulanır.
-  - Fine görüldüğünde (D.C./D.S. dönüşünde) çalma biter.
-- Sonsuz döngüye karşı playback state dedup (visited) ve makul güvenlik sınırı.
+Yenilikler:
+- D.C./D.S./To Coda/Fine için <direction-type><words> metinleri de taranır
+  (ör. "D.S. al Coda", "To Coda", "Da Capo", "Fine", "Segno", "Coda").
+- Global repeat pas sayacı: Her (start,end) çifti, tüm playback boyunca
+  en fazla 'times' kadar uygulanır (D.C./D.S. dönüşünden sonra sınırsız tekrar
+  döngülerini engeller). İsterseniz tekrarları dönüşte yeniden uygulamak için
+  REPEAT_REAPPLY_ON_RETURN=1 yapabilirsiniz.
+- playback_order.txt ile ölçü yürüyüş izini dosyaya yazar.
+- Sonsuz döngü koruması: playback state dedup + makul adım sınırı.
 
 USAGE:
   python scripts/generate_transcript.py <input.musicxml> [LIMIT]
     LIMIT: all/-1 => tümü; pozitif sayı => ilk N ölçü (repeat açılımından sonra)
 
 Outputs:
-  transcript_rh.txt, transcript_rh.json, transcript_rh.lua, transcript_rh.abc, measure_map_rh.md
+  transcript_rh.txt, transcript_rh.json, transcript_rh.lua, transcript_rh.abc, measure_map_rh.md, playback_order.txt
 """
 import os
 import sys
 import json
 import datetime
 import pathlib
+import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict, Set, Any
 
-__VERSION__ = "1.0.0"
+__VERSION__ = "1.1.0"
 
 DYNAMIC_TAGS = ["ppp","pp","p","mp","mf","f","ff","fff","fp","sfz"]
 LETTER_TO_TURKISH = {"C":"Do","D":"Re","E":"Mi","F":"Fa","G":"Sol","A":"La","B":"Si"}
 LETTER_TO_SEMITONE = {"C":0,"D":2,"E":4,"F":5,"G":7,"A":9,"B":11}
+
+REPEAT_REAPPLY_ON_RETURN = os.getenv("REPEAT_REAPPLY_ON_RETURN", "0").strip() == "1"
 
 @dataclass
 class NoteEvent:
@@ -133,6 +138,7 @@ def parse_endings(measures: List[ET.Element], ns: NS) -> Dict[int, Tuple[int, Se
         if not s: return set()
         out: Set[int] = set()
         for p in s.replace(',', ' ').split():
+            p = p.strip()
             if p.isdigit():
                 out.add(int(p))
         return out
@@ -140,8 +146,7 @@ def parse_endings(measures: List[ET.Element], ns: NS) -> Dict[int, Tuple[int, Se
     for idx, m in enumerate(measures):
         for barline in m.findall('.//' + ns.tag('barline')):
             ending = barline.find(ns.tag('ending'))
-            if ending is None:
-                continue
+            if ending is None: continue
             etype = ending.get('type')
             nums = parse_numbers(ending.get('number'))
             if etype == 'start':
@@ -185,19 +190,18 @@ def pair_repeats(measures: List[ET.Element]) -> Tuple[Dict[int, Tuple[int,int]],
                 end_to_pair[i] = (start, times)
     return start_to_pair, end_to_pair
 
-@dataclass(frozen=True)
-class FrameState:
-    start: int
-    end: int
-    pass_no: int
-    max_times: int
+# basit normalize
+_word_re = re.compile(r"[^\w]+", re.UNICODE)
+def norm_words(s: str) -> str:
+    s = s.strip().lower()
+    s = _word_re.sub(" ", s)
+    return " ".join(s.split())
 
 def scan_markers(measures: List[ET.Element]) -> Dict[str, Any]:
     if not measures:
         return {}
     ns = NS(measures[0])
 
-    # segno/coda/fine/dc/ds/tocoda per measure
     has_segno: Set[int] = set()
     has_coda: Set[int] = set()
     has_fine: Set[int] = set()
@@ -212,7 +216,26 @@ def scan_markers(measures: List[ET.Element]) -> Dict[str, Any]:
                 has_segno.add(i)
             if d.find(ns.tag('coda')) is not None:
                 has_coda.add(i)
-            # sound attributes
+
+            # words: D.C., Da Capo, D.S., To Coda, Fine, Segno, Coda
+            dtyp = d.find(ns.tag('direction-type'))
+            if dtyp is not None:
+                for w in dtyp.findall(ns.tag('words')):
+                    txt = norm_words(w.text or "")
+                    if not txt:
+                        continue
+                    if txt in ("d c", "da capo", "da capo al fine", "da capo al coda"):
+                        trig_dc.add(i)
+                    if txt.startswith("d s") or "dal segno" in txt or "del segno" in txt:
+                        trig_ds.add(i)
+                    if "to coda" in txt or txt == "coda":
+                        trig_tocoda.add(i)
+                    if txt == "fine":
+                        has_fine.add(i)
+                    if txt == "segno":
+                        has_segno.add(i)
+
+            # sound attributes (MuseScore genellikle ekler)
             sound = d.find(ns.tag('sound'))
             if sound is not None:
                 if sound.get('fine') is not None:
@@ -223,11 +246,6 @@ def scan_markers(measures: List[ET.Element]) -> Dict[str, Any]:
                     trig_ds.add(i)
                 if sound.get('tocoda') is not None:
                     trig_tocoda.add(i)
-        # Some scores mark Fine as words; basic heuristic (optional):
-        # for w in m.findall('.//' + ns.tag('words')):
-        #     text = (w.text or '').strip().lower()
-        #     if 'fine' == text:
-        #         has_fine.add(i)
 
     return {
         'ending_membership': parse_endings(measures, ns),
@@ -241,11 +259,20 @@ def scan_markers(measures: List[ET.Element]) -> Dict[str, Any]:
         'trig_tocoda': trig_tocoda,
     }
 
+@dataclass(frozen=True)
+class FrameState:
+    start: int
+    end: int
+    pass_no: int
+    max_times: int
+
 def expand_playback(measures: List[ET.Element]) -> List[int]:
     """
     Repeat + Volta + DC/DS/To Coda/Fine çalma sırası.
-    DC/DS her biri en fazla bir kez; To Coda dönüş sonrası tek sefer.
-    Sonsuz döngüye karşı state-dedup uygulanır.
+    - DC/DS her biri en fazla bir kez.
+    - To Coda dönüş sonrasında bir kez.
+    - Global repeat sayaçları: Her (start,end) çifti toplamda 'times' kadar.
+      REPEAT_REAPPLY_ON_RETURN=1 ise dönüşlerde tekrar yeniden uygulanır.
     """
     n = len(measures)
     if n == 0:
@@ -274,48 +301,43 @@ def expand_playback(measures: List[ET.Element]) -> List[int]:
     used_ds = False
     jumped_coda = False
 
-    # visited state dedup: (i, tuple(FrameState), used_dc, used_ds, jumped_coda)
+    # Global repeat kullanım sayacı
+    global_repeat_count: Dict[Tuple[int,int], int] = {}
+
     visited: Set[Tuple[int, Tuple[FrameState, ...], bool, bool, bool]] = set()
 
     raw_n = n
-    max_steps = max(2000, raw_n * 12)  # makul güvenlik üst sınırı
-
+    max_steps = max(1500, raw_n * 8)  # güvenlik: orijinalin ~8 katı
     steps = 0
     DEBUG = os.getenv('DEBUG_PLAYBACK', '0') == '1'
-    def dbg(msg: str):
-        if DEBUG and steps < 500:
-            print(f"[DBG] {msg}", file=sys.stderr)
 
     while 0 <= i < n and steps < max_steps:
         steps += 1
 
-        # Volta ending: aktif repeat varsa ve bu ölçü geçerli pass için uygun değilse, ending bloğunu atla
+        # Volta ending uygunsuzsa o bloğu atla
         if frames:
             end_tup = ending_membership.get(i)
             if end_tup:
                 end_idx, ending_nums = end_tup
                 s, e, pass_no, max_times = frames[-1]
                 if ending_nums and (pass_no not in ending_nums):
-                    dbg(f"skip ending block at {i} (pass {pass_no} not in {ending_nums}) -> {end_idx+1}")
                     i = end_idx + 1
                     continue
 
-        # State dedup
         fs = tuple(FrameState(*f) for f in frames)
         state = (i, fs, used_dc, used_ds, jumped_coda)
         if state in visited:
-            print(f"UYARI: Playback state tekrarlandı (olası döngü). Çalma sonlandırıldı. i={i}, frames={fs}, dc={used_dc}, ds={used_ds}, coda={jumped_coda}", file=sys.stderr)
+            # Aynı bağlam tekrarlandığında çalmayı bitir (döngü)
+            print(f"UYARI: Playback state tekrarlandı, çalma sonlandırıldı. i={i}, frames={fs}, dc={used_dc}, ds={used_ds}, coda={jumped_coda}", file=sys.stderr)
             break
         visited.add(state)
 
         playback.append(i)
-        dbg(f"play {i}")
 
-        # İç içe repeat başlangıcı
+        # Repeat başlangıcı
         if i in start_to_pair:
             end_idx, times = start_to_pair[i]
             frames.append((i, end_idx, 1, max(1, times)))
-            dbg(f"open repeat {i}..{end_idx} times={times}")
 
         # Repeat bitişi
         if i in end_to_pair and frames:
@@ -324,58 +346,76 @@ def expand_playback(measures: List[ET.Element]) -> List[int]:
             if s == start_idx and e == i:
                 if times_b:
                     max_times = times_b
-                if pass_no < max_times:
-                    frames[-1] = (s, e, pass_no + 1, max_times)
-                    dbg(f"repeat back {i} -> {s} (pass {pass_no+1}/{max_times})")
-                    i = s
-                    continue
+                # Global sayaç kontrolü
+                pair_key = (s, e)
+                cur_used = global_repeat_count.get(pair_key, 0)
+                # Dönüşte repeat tekrar açılsın mı?
+                allowed_times_total = max_times if REPEAT_REAPPLY_ON_RETURN else max_times
+                # Eğer dönüşte tekrar açılmasını istemiyorsanız, global toplamı max_times ile sınırlarız:
+                if not REPEAT_REAPPLY_ON_RETURN:
+                    if cur_used >= allowed_times_total - 1:  # ilk çalım + (times-1) tekrar
+                        frames.pop()
+                    else:
+                        if pass_no < max_times:
+                            frames[-1] = (s, e, pass_no + 1, max_times)
+                            global_repeat_count[pair_key] = cur_used + 1
+                            i = s
+                            continue
+                        else:
+                            frames.pop()
                 else:
-                    dbg(f"close repeat {s}..{e}")
-                    frames.pop()
+                    # Dönüşte yeniden uygulama açık ise, sadece lokal çerçeveye göre karar ver
+                    if pass_no < max_times:
+                        frames[-1] = (s, e, pass_no + 1, max_times)
+                        global_repeat_count[pair_key] = cur_used + 1
+                        i = s
+                        continue
+                    else:
+                        frames.pop()
 
-        # D.C. / D.S. / To Coda / Fine mantığı (ölçü sonunda)
-        will_jump = False
-        # Fine: dönüşten sonra Fine'da bitir
+        # Fine: DS/DC dönüşünden sonra Fine'da bitir
         if i in has_fine and (used_dc or used_ds):
-            dbg(f"Fine at {i} -> stop")
             break
 
         # D.S.
-        if (i in trig_ds) and (not used_ds) and segno_idx is not None:
+        did_jump = False
+        if (i in trig_ds) and (not used_ds) and (segno_idx is not None):
             used_ds = True
-            frames.clear()  # dönüşte repeat çerçevelerini sıfırla
-            dbg(f"DS trigger at {i} -> jump to segno {segno_idx}")
+            frames.clear()
             i = segno_idx
-            will_jump = True
+            did_jump = True
 
         # D.C.
-        if (not will_jump) and (i in trig_dc) and (not used_dc):
+        if (not did_jump) and (i in trig_dc) and (not used_dc):
             used_dc = True
             frames.clear()
-            dbg(f"DC trigger at {i} -> jump to start 0")
             i = 0
-            will_jump = True
+            did_jump = True
 
-        # To Coda (ancak DC veya DS uygulanmışsa ve henüz coda'ya atlanmamışsa)
-        if (not will_jump) and (i in trig_tocoda) and (coda_idx is not None) and (used_dc or used_ds) and (not jumped_coda):
+        # To Coda (yalnız dönüş sonrası)
+        if (not did_jump) and (i in trig_tocoda) and (coda_idx is not None) and (used_dc or used_ds) and (not jumped_coda):
             jumped_coda = True
             frames.clear()
-            dbg(f"To Coda at {i} -> jump to coda {coda_idx}")
             i = coda_idx
-            will_jump = True
+            did_jump = True
 
-        if will_jump:
+        if did_jump:
             continue
 
-        # Normal ilerleme
         i += 1
 
     if steps >= max_steps:
-        print(f"UYARI: Playback açılımı güvenlik sınırında durduruldu ({steps} adım). Repeat/işaretleri kontrol edin.", file=sys.stderr)
+        print(f"UYARI: Playback açılımı güvenlik sınırında durduruldu ({steps} adım). İşaretleri kontrol edin.", file=sys.stderr)
 
-    # Uç büyümeyi uyar
     if len(playback) > raw_n * 8:
-        print(f"UYARI: Playback uzunluğu sıra dışı: {raw_n} -> {len(playback)} ölçü. İşaretlerde sonsuz döngüye yol açan kurgu olabilir.", file=sys.stderr)
+        print(f"UYARI: Playback uzunluğu sıra dışı: {raw_n} -> {len(playback)} ölçü.", file=sys.stderr)
+
+    # Debug: playback_order.txt yaz
+    try:
+        with open("playback_order.txt", "w", encoding="utf-8") as f:
+            f.write("\n".join(str(x) for x in playback))
+    except Exception:
+        pass
 
     return playback
 
@@ -385,7 +425,6 @@ def extract_measures(tree: ET.ElementTree, limit: Optional[int]=None) -> List[Li
     raw = collect_measures(root)
     order = expand_playback(raw)
 
-    # LIMIT uygula
     if limit is not None and limit >= 0:
         order = order[:limit]
 
@@ -447,7 +486,8 @@ def extract_measures(tree: ET.ElementTree, limit: Optional[int]=None) -> List[Li
                     dur_txt = child.findtext(ns.tag('duration'))
                     dur_div = int(dur_txt) if (dur_txt and dur_txt.isdigit()) else 0
                     # chord olmayan notalarda ilerle
-                    if m.find(ns.tag('chord')) is None:
+                    chord_tag = child.find(ns.tag('chord'))
+                    if chord_tag is None:
                         cur_div_pos += dur_div
                         max_div_pos = max(max_div_pos, cur_div_pos)
             measure_beats = max_div_pos / divisions if divisions else 0.0
@@ -610,7 +650,7 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
             'generated_utc': now,
             'measure_count': len(measures),
             'event_count': len(events),
-            'format_version': 10,
+            'format_version': 11,
             'script_version': __VERSION__,
         },
         'events': events
@@ -673,7 +713,8 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
     lua_lines.append("}")
     (out_dir/"transcript_rh.lua").write_text("\n".join(lua_lines), encoding="utf-8")
 
-    print(f"Wrote {len(events)} RH events across {len(measures)} measures.")
+    print(f"\\n[INFO] Wrote {len(events)} RH events across {len(measures)} measures.")
+    # playback_order.txt zaten expand_playback içinde yazıldı.
 
 def parse_limit_arg(raw: Optional[str]) -> Optional[int]:
     if not raw:
@@ -691,7 +732,7 @@ def main():
     if len(sys.argv) < 2:
         print("USAGE: python scripts/generate_transcript.py <input.musicxml> [LIMIT]\n"
               "LIMIT = all/-1 (tümü) veya pozitif sayı (ilk N ölçü)\n"
-              "Çıktılar: transcript_rh.txt, .json, .lua, .abc, .md\n", file=sys.stderr)
+              "Çıktılar: transcript_rh.txt, .json, .lua, .abc, .md, playback_order.txt\n", file=sys.stderr)
         sys.exit(1)
     path = pathlib.Path(sys.argv[1])
     if not path.exists():
