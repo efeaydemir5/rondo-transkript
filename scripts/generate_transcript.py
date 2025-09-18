@@ -3,42 +3,22 @@
 Enhanced MusicXML -> multi-format transcript & Roblox Lua exporter.
 
 Features:
- - Full piece extraction (limit = -1 or 'all')
- - Basic forward/backward repeat expansion (single-level)
- - Tie merging (contiguous same pitch)
- - Dynamics parsing (ppp..fff, sfz, fp)
- - Articulations (staccato, accent, tenuto, marcato)
- - Slur start/end flags
- - Tempo changes via <sound tempo="">
- - Grace notes (dur=0, zaman ilerletmez)
- - Outputs:
-     * transcript_full.txt
-     * transcript_full.json
-     * transcript_full.abc (placeholder)
-     * measure_map.md
-     * transcript_full.lua (Roblox friendly)
+- Extracts entire MusicXML piece, including all measures and basic repeats.
+- Expands simple forward/backward repeats (not DC/segno/coda/ending).
+- Outputs to .txt, .json, .abc, .md, .lua formats.
+- LIMIT param: integer (number of measures to extract) or -1/'all' (extracts ALL).
 
-Pitch data:
- - Turkish pitch adları (Do,Re...) + alter (#/b) + oktav
- - Scientific pitch (C#4, Eb5 ...)
- - MIDI numaraları
-
-Limitations / TODO:
- - Çok karmaşık tekrar/ending/DC/segno senaryoları yok
- - Çoklu voice birleşimi basit sırada
- - Pedal / crescendo / lyrics yok
- - Bir ölçü içinde değişen divisions (nadir) yeniden hesaplanmıyor
-
-Usage:
-    python scripts/generate_transcript.py HAHA.musicxml [LIMIT]
-Where LIMIT integer veya -1 / all.
+USAGE:
+    python scripts/generate_transcript.py <input.musicxml> [LIMIT]
+If LIMIT is omitted, ALL measures are extracted (default).
 """
+
 from __future__ import annotations
 import sys, json, datetime, pathlib, xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-__VERSION__ = "0.3.4"
+__VERSION__ = "0.3.5"
 
 LETTER_TO_TURKISH = {"C":"Do","D":"Re","E":"Mi","F":"Fa","G":"Sol","A":"La","B":"Si"}
 LETTER_TO_SEMITONE = {"C":0,"D":2,"E":4,"F":5,"G":7,"A":9,"B":11}
@@ -138,6 +118,11 @@ def expand_repeats_basic(measures: List[ET.Element]) -> List[ET.Element]:
                         seg = measures[start:i+1]
                         expanded.extend(seg)
                         used_backward.add(i)
+        # UYARI: DC/segno/coda/ending şu anda desteklenmiyor!
+        # Bu tür tekrarlar için log veya print eklenebilir.
+        for sound in m.findall('.//'+ns.tag('sound')):
+            if sound.get('dalsegno') or sound.get('dacapo') or sound.get('fine'):
+                print(f"UYARI: Karmaşık tekrar (DC/segno/fine) algılandı; script sadece basit repeat açar!", file=sys.stderr)
         i+=1
     return expanded
 
@@ -170,6 +155,7 @@ def extract_measures(tree: ET.ElementTree, limit: int=-1) -> List[LinearMeasure]
     current_dynamic=None
     current_tempo=120.0
     staff_time_beats={1:0.0, 2:0.0}
+    current_divisions = 1
 
     for lin_idx, m in enumerate(expanded):
         no_txt = m.get('number','0')
@@ -181,10 +167,10 @@ def extract_measures(tree: ET.ElementTree, limit: int=-1) -> List[LinearMeasure]
 
         attr = m.find(ns.tag('attributes'))
         div_el = attr.find(ns.tag('divisions')) if attr is not None else None
-        try:
-            divisions = int(div_el.text) if div_el is not None else 1
-        except (TypeError, ValueError):
-            divisions = 1
+        # DÜZELTME: divisions etiketi yoksa bir önceki divisions değeri korunur
+        if div_el is not None and div_el.text and div_el.text.isdigit():
+            current_divisions = int(div_el.text)
+        divisions = current_divisions
 
         for direction in m.findall(ns.tag('direction')):
             dyn = dynamic_from_direction(direction, ns)
@@ -392,7 +378,9 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: generate_transcript.py HAHA.musicxml [LIMIT]", file=sys.stderr)
+        print("USAGE: python scripts/generate_transcript.py <input.musicxml> [LIMIT]\n"
+              "LIMIT = number of measures, or -1/all (default: all measures, including repeats)\n"
+              "Example: python scripts/generate_transcript.py mypiece.musicxml 12", file=sys.stderr)
         sys.exit(1)
     path = pathlib.Path(sys.argv[1])
     if not path.exists():
