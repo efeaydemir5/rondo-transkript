@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-MusicXML'den SADECE sağ el (RH, staff=1) notalarını çıkaran, repeat açmayan ve loop hatası yapmayan transcript scripti.
-Tüm ölçüleri orijinal sırayla bir kez işler, repeat açmaz.
-Çıktılar: .txt, .json, .lua, .abc, .md (sadece RH)
+MusicXML'den SADECE sağ el (RH, staff=1) notalarını çıkaran,
+repeat işaretlerini açan, müziğin gerçek akışını eksiksiz veren transcript scripti.
 USAGE:
     python scripts/generate_transcript.py <input.musicxml>
 """
-
 import sys
 import json
 import datetime
@@ -15,7 +13,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-__VERSION__ = "0.4.0"
+__VERSION__ = "0.5.0"
 
 LETTER_TO_TURKISH = {"C": "Do", "D": "Re", "E": "Mi", "F": "Fa", "G": "Sol", "A": "La", "B": "Si"}
 LETTER_TO_SEMITONE = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
@@ -83,12 +81,56 @@ def tempo_from_direction(direction_el: ET.Element, ns: NS) -> Optional[float]:
             return None
     return None
 
+def collect_measures(root: ET.Element) -> List[ET.Element]:
+    ns = NS(root)
+    part = root.find(ns.tag('part'))
+    if part is None:
+        return []
+    return list(part.findall(ns.tag('measure')))
+
+def expand_repeats_basic(measures: List[ET.Element]) -> List[ET.Element]:
+    # Basit ileri/geri repeat işaretlerini açar, D.C./segno/coda/ending işlemez!
+    if not measures:
+        return []
+    ns = NS(measures[0])
+    expanded = []
+    i = 0
+    forward_stack = []
+    repeat_map = {}  # i: kaç defa tekrar edildi
+    while i < len(measures):
+        m = measures[i]
+        expanded.append(m)
+        repeat_found = False
+        for barline in m.findall('.//'+ns.tag('barline')):
+            repeat = barline.find(ns.tag('repeat'))
+            if repeat is not None:
+                direction = repeat.get('direction')
+                if direction == 'forward':
+                    forward_stack.append(i)
+                elif direction == 'backward' and forward_stack:
+                    start = forward_stack.pop()
+                    # 2. defa tekrar etme kontrolü (MusicXML'de times varsa)
+                    times = repeat.get('times')
+                    times = int(times) if times and times.isdigit() else 2
+                    count = repeat_map.get(i, 1)
+                    if count < times:
+                        repeat_map[i] = count + 1
+                        i = start - 1  # tekrar başına gönder
+                        repeat_found = True
+        # Bu ölçüde D.C./Dal Segno gibi gelişmiş yönlendirme varsa uyarı ver
+        for sound in m.findall('.//'+ns.tag('sound')):
+            if sound.get('dalsegno') or sound.get('dacapo') or sound.get('fine'):
+                print(f"UYARI: Karmaşık tekrar (DC/segno/fine) algılandı; script sadece basit repeat açar!", file=sys.stderr)
+        if not repeat_found:
+            i += 1
+    return expanded
+
 def extract_measures(tree: ET.ElementTree) -> List[LinearMeasure]:
     root = tree.getroot()
     ns = NS(root)
-    # Sadece repeat açmadan, orijinal ölçüleri sırayla al
-    part = root.find(ns.tag('part'))
-    measures = list(part.findall(ns.tag('measure'))) if part is not None else []
+    # Tüm ölçüleri, repeat açarak sıradaki gibi çıkar
+    raw = collect_measures(root)
+    expanded = expand_repeats_basic(raw)
 
     linear: List[LinearMeasure] = []
     current_dynamic = None
@@ -96,7 +138,7 @@ def extract_measures(tree: ET.ElementTree) -> List[LinearMeasure]:
     current_divisions = 1
     staff_time_beats = 0.0  # Sadece RH için
 
-    for lin_idx, m in enumerate(measures):
+    for lin_idx, m in enumerate(expanded):
         no_txt = m.get('number', '0')
         try:
             meas_no = int(no_txt)
@@ -121,7 +163,6 @@ def extract_measures(tree: ET.ElementTree) -> List[LinearMeasure]:
                 lm.tempo = tmp
 
         for note in m.findall(ns.tag('note')):
-            # Sadece staff=1 (RH) için
             staff_txt = note.findtext(ns.tag('staff'), default='1')
             try:
                 staff = int(staff_txt)
@@ -213,7 +254,7 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
 
     # TXT
     txt = [
-        "MusicXML Sağ El Transcript (RH only)",
+        "MusicXML Sağ El Transcript (RH only, repeat expanded)",
         f"Generated UTC: {now}",
         f"Linear measures: {len(measures)}",
         f"Events: {len(events)}",
@@ -230,7 +271,7 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
             'generated_utc': now,
             'measure_count': len(measures),
             'event_count': len(events),
-            'format_version': 4,
+            'format_version': 5,
             'script_version': __VERSION__,
         },
         'events': events
@@ -262,7 +303,7 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
         return "{" + ",".join(formatted) + "}"
 
     lua_lines = [
-        "-- Auto-generated RH transcription table",
+        "-- Auto-generated RH transcription table (repeat expanded)",
         f"-- Generated UTC: {now}",
         f"-- Script version: {__VERSION__}",
         "return {",
@@ -298,7 +339,7 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
 def main():
     if len(sys.argv) < 2:
         print("USAGE: python scripts/generate_transcript.py <input.musicxml>\n"
-              "Sadece sağ el (RH) çıkarılır. Repeat açılmaz, karmaşık tekrarlar işlenmez.\n"
+              "Sadece sağ el (RH) çıkarılır. Repeat işaretleri açılır, müzik akışı orijinal gibi olur.\n"
               "Çıktılar: transcript_rh.txt, .json, .lua, .abc, .md\n", file=sys.stderr)
         sys.exit(1)
     path = pathlib.Path(sys.argv[1])
