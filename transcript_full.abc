@@ -1,8 +1,8 @@
 X:1
-T:Rondo alla Turca (Extracted)
+T:Rondo alla Turca (Right Hand Only)
 M:2/4
 L:1/16
 Q:1/4=120
 K:C
 V:1 clef=treble
-V:2 clef=bass
+% Right hand only, no repeat expansion

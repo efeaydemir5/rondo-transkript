@@ -1,0 +1,21 @@
+# Generated output files
+transcript_full.txt
+transcript_full.json
+transcript_full.lua
+transcript_full.abc
+measure_map.md
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db

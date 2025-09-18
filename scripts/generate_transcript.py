@@ -3,8 +3,8 @@
 Enhanced MusicXML -> multi-format transcript & Roblox Lua exporter.
 
 Features:
-- Extracts entire MusicXML piece, including all measures and basic repeats.
-- Expands simple forward/backward repeats (not DC/segno/coda/ending).
+- Extracts entire MusicXML piece, processing all original measures in sequence.
+- Extracts only right hand (staff=1) notes, ignoring left hand and other staffs.
 - Outputs to .txt, .json, .abc, .md, .lua formats.
 - LIMIT param: integer (number of measures to extract) or -1/'all' (extracts ALL).
 
@@ -95,36 +95,6 @@ def collect_measures(root: ET.Element) -> List[ET.Element]:
         return []
     return list(part.findall(ns.tag('measure')))
 
-def expand_repeats_basic(measures: List[ET.Element]) -> List[ET.Element]:
-    if not measures:
-        return []
-    ns = NS(measures[0])
-    forward_stack=[]
-    expanded=[]
-    used_backward=set()
-    i=0
-    while i < len(measures):
-        m=measures[i]
-        expanded.append(m)
-        for barline in m.findall('.//'+ns.tag('barline')):
-            repeat = barline.find(ns.tag('repeat'))
-            if repeat is not None:
-                direction = repeat.get('direction')
-                if direction == 'forward':
-                    forward_stack.append(i)
-                elif direction == 'backward' and forward_stack:
-                    if i not in used_backward:
-                        start = forward_stack.pop()
-                        seg = measures[start:i+1]
-                        expanded.extend(seg)
-                        used_backward.add(i)
-        # UYARI: DC/segno/coda/ending şu anda desteklenmiyor!
-        # Bu tür tekrarlar için log veya print eklenebilir.
-        for sound in m.findall('.//'+ns.tag('sound')):
-            if sound.get('dalsegno') or sound.get('dacapo') or sound.get('fine'):
-                print(f"UYARI: Karmaşık tekrar (DC/segno/fine) algılandı; script sadece basit repeat açar!", file=sys.stderr)
-        i+=1
-    return expanded
 
 def dynamic_from_direction(direction_el: ET.Element, ns: NS) -> Optional[str]:
     dtyp = direction_el.find(ns.tag('direction-type')) if direction_el is not None else None
@@ -147,17 +117,19 @@ def extract_measures(tree: ET.ElementTree, limit: int=-1) -> List[LinearMeasure]
     root = tree.getroot()
     ns = NS(root)
     raw = collect_measures(root)
-    expanded = expand_repeats_basic(raw)
+    # Process original measures without expansion
+    measures_to_process = raw
     if limit not in (-1, None) and limit >= 0:
-        expanded = expanded[:limit]
+        measures_to_process = measures_to_process[:limit]
 
     linear: List[LinearMeasure] = []
     current_dynamic=None
     current_tempo=120.0
-    staff_time_beats={1:0.0, 2:0.0}
+    # Only track right hand timing since we're only processing staff=1
+    staff_time_beats={1:0.0}
     current_divisions = 1
 
-    for lin_idx, m in enumerate(expanded):
+    for lin_idx, m in enumerate(measures_to_process):
         no_txt = m.get('number','0')
         try:
             meas_no = int(no_txt)
@@ -189,6 +161,11 @@ def extract_measures(tree: ET.ElementTree, limit: int=-1) -> List[LinearMeasure]
                 staff = int(staff_txt)
             except ValueError:
                 staff = 1
+            
+            # Only process right hand notes (staff=1)
+            if staff != 1:
+                continue
+                
             duration_div = note.findtext(ns.tag('duration'))
             grace = note.find(ns.tag('grace')) is not None
 
@@ -236,10 +213,10 @@ def extract_measures(tree: ET.ElementTree, limit: int=-1) -> List[LinearMeasure]
                 slur_start=slur_start,
                 slur_end=slur_end,
                 grace=grace,
-                hand='RH' if staff==1 else 'LH'
+                hand='RH'  # Always RH since we only process staff=1
             )
-            target = lm.RH if staff==1 else lm.LH
-            target.append(ev)
+            # Only add to RH since we're only processing staff=1
+            lm.RH.append(ev)
             if not grace:
                 staff_time_beats[staff]=start_beats+dur_beats
         linear.append(lm)
@@ -257,19 +234,20 @@ def extract_measures(tree: ET.ElementTree, limit: int=-1) -> List[LinearMeasure]
                 merged.append(ev)
         return merged
 
+    # Only merge RH ties since we're only processing right hand
     for lm in linear:
         lm.RH = merge_ties(lm.RH)
-        lm.LH = merge_ties(lm.LH)
 
     return linear
 
 def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
     out_dir.mkdir(parents=True, exist_ok=True)
-    now = datetime.datetime.utcnow().isoformat()
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
     events=[]
     for m in measures:
-        for ev in m.RH + m.LH:
+        # Only process RH events, ignore LH completely
+        for ev in m.RH:
             events.append({
                 't': round(ev.t_seconds,6),
                 'dur': round(ev.dur_seconds,6),
@@ -285,15 +263,15 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
                 'slur_end': ev.slur_end,
                 'grace': ev.grace,
             })
-    events.sort(key=lambda e: (e['t'], e['hand']))
+    events.sort(key=lambda e: e['t'])  # Only sort by time since all events are RH
 
     # TXT
     txt = [
-        "Piano Sonata No.11 - Rondo alla Turca (Enhanced Export)",
+        "Piano Sonata No.11 - Rondo alla Turca (Right Hand Only)",
         f"Generated UTC: {now}",
         "Source: HAHA.musicxml",
         f"Linear measures: {len(measures)}",
-        f"Events: {len(events)}",
+        f"Events: {len(events)} (Right Hand Only)",
         "---",
         "time_sec\tdur_sec\thand\tpitches_sci\tdyn\tart"
     ]
@@ -304,28 +282,29 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
     # JSON
     json_obj={
         'metadata':{
-            'title':'Piano Sonata No.11 - Rondo alla Turca',
+            'title':'Piano Sonata No.11 - Rondo alla Turca (Right Hand Only)',
             'source_file':'HAHA.musicxml',
             'generated_utc':now,
             'measure_count':len(measures),
             'event_count':len(events),
             'format_version':3,
             'script_version':__VERSION__,
+            'note':'Right hand (staff=1) only, no repeat expansion'
         },
         'events':events
     }
     (out_dir/"transcript_full.json").write_text(json.dumps(json_obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # ABC placeholder
-    abc_lines=["X:1","T:Rondo alla Turca (Extracted)","M:2/4","L:1/16","Q:1/4=120","K:C","V:1 clef=treble","V:2 clef=bass"]
+    abc_lines=["X:1","T:Rondo alla Turca (Right Hand Only)","M:2/4","L:1/16","Q:1/4=120","K:C","V:1 clef=treble","% Right hand only, no repeat expansion"]
     (out_dir/"transcript_full.abc").write_text("\n".join(abc_lines), encoding="utf-8")
 
-    # Measure map
-    map_lines=["# Measure Map","",
-               "| LinearIndex | OriginalMeasure | RH_events | LH_events |",
-               "|------------:|---------------:|----------:|----------:|"]
+    # Measure map - only show RH events since LH is always 0
+    map_lines=["# Measure Map (Right Hand Only)","",
+               "| LinearIndex | OriginalMeasure | RH_events |",
+               "|------------:|---------------:|----------:|"]
     for m in measures:
-        map_lines.append(f"| {m.linear_index} | {m.original_measure} | {len(m.RH)} | {len(m.LH)} |")
+        map_lines.append(f"| {m.linear_index} | {m.original_measure} | {len(m.RH)} |")
     (out_dir/"measure_map.md").write_text("\n".join(map_lines), encoding="utf-8")
 
     # Lua exporter helpers
@@ -341,15 +320,17 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
         return "{" + ",".join(formatted) + "}"
 
     lua_lines=[
-        "-- Auto-generated transcription table",
+        "-- Auto-generated transcription table (Right Hand Only)",
         f"-- Generated UTC: {now}",
         f"-- Script version: {__VERSION__}",
+        "-- Note: Right hand (staff=1) only, no repeat expansion",
         "return {",
         "  metadata = {",
-        "    title = 'Piano Sonata No.11 - Rondo alla Turca',",
+        "    title = 'Piano Sonata No.11 - Rondo alla Turca (Right Hand Only)',",
         f"    generated_utc = '{now}',",
         f"    event_count = {len(events)},",
         f"    script_version = '{__VERSION__}',",
+        "    note = 'Right hand (staff=1) only, no repeat expansion',",
         "  },",
         "  notes = {"
     ]
@@ -374,12 +355,13 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
     lua_lines.append("}")
     (out_dir/"transcript_full.lua").write_text("\n".join(lua_lines), encoding="utf-8")
 
-    print(f"Wrote {len(events)} events across {len(measures)} measures.")
+    print(f"Wrote {len(events)} RH-only events across {len(measures)} measures.")
 
 def main():
     if len(sys.argv) < 2:
         print("USAGE: python scripts/generate_transcript.py <input.musicxml> [LIMIT]\n"
-              "LIMIT = number of measures, or -1/all (default: all measures, including repeats)\n"
+              "LIMIT = number of measures, or -1/all (default: all measures, no repeat expansion)\n"
+              "Note: Only extracts right hand (staff=1) notes\n"
               "Example: python scripts/generate_transcript.py mypiece.musicxml 12", file=sys.stderr)
         sys.exit(1)
     path = pathlib.Path(sys.argv[1])
