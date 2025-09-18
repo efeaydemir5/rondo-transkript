@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       limit:
-        description: "Ölçü limiti (varsayılan 20)"
+        description: "Ölçü limiti (all, -1 ya da pozitif sayı). Tüm parça için 'all' kullanın."
         required: false
-        default: "20"
+        default: "all"
       commit:
         description: "Değişiklikleri commit et (true/false)"
         required: false
@@ -58,28 +58,47 @@ jobs:
 
           echo "Bulunan script   : ${SCRIPT_PATH}"
           echo "Bulunan MusicXML : ${MUSICXML_PATH}"
-          echo "Limit            : ${{ github.event.inputs.limit }}"
+          echo "Limit (girdi)    : ${{ github.event.inputs.limit }}"
 
+          # Limit parametresi destekleyen eski script için:
+          # - all veya -1 tam parça
+          # Limit parametresini okumayan yeni scriptler için ek argüman zararsızdır (yok sayılır).
           python "${SCRIPT_PATH}" "${MUSICXML_PATH}" "${{ github.event.inputs.limit }}"
 
-          # Sadece TXT kalsın
-          rm -f transcript_full.json transcript_full.abc measure_map.md 2>/dev/null || true
+          # Olası çıktı dosya adları
+          CANDIDATES=("transcript_rh.txt" "transcript_full.txt")
+          OUT_TXT=""
+          for f in "${CANDIDATES[@]}"; do
+            if [ -f "$f" ]; then
+              OUT_TXT="$f"
+              break
+            fi
+          done
 
-          if [ ! -f transcript_full.txt ]; then
-            echo "HATA: transcript_full.txt oluşturulmadı. Script içinde çıktı dosya adı farklı olabilir." >&2
+          if [ -z "$OUT_TXT" ]; then
+            echo "HATA: Beklenen çıktı dosyası bulunamadı. Script hangi ada yazıyor kontrol edin (transcript_rh.txt veya transcript_full.txt)." >&2
+            ls -al
             exit 2
           fi
 
-          echo "---- transcript_full.txt (ilk 25 satır) ----"
-          head -n 25 transcript_full.txt || true
-          echo "-------------------------------------------"
+          echo "Çıktı dosyası: $OUT_TXT"
+          echo "---- ${OUT_TXT} (ilk 25 satır) ----"
+          head -n 25 "$OUT_TXT" || true
+          echo "-----------------------------------"
+
+          echo "out_txt=${OUT_TXT}" >> $GITHUB_OUTPUT
 
       - name: Değişiklik kontrol
         id: diffcheck
         run: |
-          if [ -n "$(git status --porcelain transcript_full.txt)" ]; then
+          OUT_TXT="${{ steps.runscript.outputs.out_txt }}"
+          if [ -z "$OUT_TXT" ]; then
+            echo "HATA: OUT_TXT boş." >&2
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain "$OUT_TXT")" ]; then
             echo "changed=true" >> $GITHUB_OUTPUT
-            echo "transcript_full.txt değişmiş."
+            echo "$OUT_TXT değişmiş."
           else
             echo "changed=false" >> $GITHUB_OUTPUT
             echo "Değişiklik yok (commit atlanacak)."
@@ -89,10 +108,11 @@ jobs:
         if: steps.diffcheck.outputs.changed == 'true' && github.event.inputs.commit == 'true'
         run: |
           set -e
+          OUT_TXT="${{ steps.runscript.outputs.out_txt }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add transcript_full.txt
-          git commit -m "chore: auto-generate transcript_full.txt (limit=${{ github.event.inputs.limit }})"
+          git add "$OUT_TXT"
+          git commit -m "chore: auto-generate ${OUT_TXT} (limit=${{ github.event.inputs.limit }})"
           git push
           echo "Commit ve push tamam."
 
@@ -100,5 +120,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: transcript_txt
-          path: transcript_full.txt
+          path: ${{ steps.runscript.outputs.out_txt }}
           if-no-files-found: error
