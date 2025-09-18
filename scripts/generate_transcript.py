@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
 """
 MusicXML'den SADECE sağ el (RH, staff=1) notalarını çıkaran,
-repeat işaretlerini açan, müziğin gerçek çalınış sırasını eksiksiz veren transcript scripti.
+repeat (ileri/geri) ve volta (1.,2. son) işaretlerini açan ve
+ölçü içi akışı (note/backup/forward/chord) doğru takip eden transcript scripti.
+
+- Müziğin gerçek çalınış sırasını bozmadan tekrarları genişletir (|: ... :| ve 1.,2. ending).
+- RH dışındaki içerik ZAMAN AKIŞINI belirlemek için dikkate alınır (ölçü süresi doğru ilerler),
+  ama çıktıya sadece RH olayları yazılır.
+- D.C./D.S./Coda/Fine için uyarı verir (tam simülasyon opsiyonel olarak eklenebilir).
+
 USAGE:
     python scripts/generate_transcript.py <input.musicxml>
+Outputs:
+    transcript_rh.txt, transcript_rh.json, transcript_rh.lua, transcript_rh.abc, measure_map_rh.md
 """
 
 import sys
@@ -12,13 +21,13 @@ import datetime
 import pathlib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple, Dict, Set
 
-__VERSION__ = "0.5.1"
+__VERSION__ = "0.6.0"
 
-LETTER_TO_TURKISH = {"C": "Do", "D": "Re", "E": "Mi", "F": "Fa", "G": "Sol", "A": "La", "B": "Si"}
-LETTER_TO_SEMITONE = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
 DYNAMIC_TAGS = ["ppp","pp","p","mp","mf","f","ff","fff","fp","sfz"]
+LETTER_TO_TURKISH = {"C":"Do","D":"Re","E":"Mi","F":"Fa","G":"Sol","A":"La","B":"Si"}
+LETTER_TO_SEMITONE = {"C":0,"D":2,"E":4,"F":5,"G":7,"A":9,"B":11}
 
 @dataclass
 class NoteEvent:
@@ -40,8 +49,8 @@ class LinearMeasure:
     linear_index: int
     original_measure: int
     RH: List[NoteEvent] = field(default_factory=list)
-    tempo: Optional[float]=None
-    new_dynamic: Optional[str]=None
+    tempo: Optional[float] = None
+    new_dynamic: Optional[str] = None
 
 class NS:
     def __init__(self, root: ET.Element):
@@ -74,6 +83,7 @@ def dynamic_from_direction(direction_el: ET.Element, ns: NS) -> Optional[str]:
     return None
 
 def tempo_from_direction(direction_el: ET.Element, ns: NS) -> Optional[float]:
+    # MusicXML'de tempo çoğunlukla <direction><sound tempo="..."> ile gelir
     sound = direction_el.find(ns.tag('sound')) if direction_el is not None else None
     if sound is not None and sound.get('tempo'):
         try:
@@ -89,54 +99,136 @@ def collect_measures(root: ET.Element) -> List[ET.Element]:
         return []
     return list(part.findall(ns.tag('measure')))
 
-def expand_repeats_basic(measures: List[ET.Element]) -> List[ET.Element]:
-    # Basit ileri/geri repeat işaretlerini açar, D.C./segno/coda/ending işlemez!
+def parse_ending_ranges(measures: List[ET.Element], ns: NS) -> Dict[int, Tuple[int, Set[int]]]:
+    """
+    Ending kapsamlarını çıkar. Sonuç: ending_membership[i] = (end_idx, {1,2,...})
+    """
+    ending_membership: Dict[int, Tuple[int, Set[int]]] = {}
+    active_start = None
+    active_numbers: Set[int] = set()
+
+    def parse_numbers(text: Optional[str]) -> Set[int]:
+        if not text:
+            return set()
+        nums = set()
+        for part in text.replace(',', ' ').split():
+            if part.isdigit():
+                nums.add(int(part))
+        return nums
+
+    for idx, m in enumerate(measures):
+        for barline in m.findall('.//' + ns.tag('barline')):
+            ending = barline.find(ns.tag('ending'))
+            if ending is None:
+                continue
+            etype = ending.get('type')  # start, stop, discontinue
+            numbers = parse_numbers(ending.get('number'))
+            if etype == 'start':
+                active_start = idx
+                active_numbers = numbers if numbers else set()
+            elif etype in ('stop', 'discontinue'):
+                if active_start is not None:
+                    for k in range(active_start, idx + 1):
+                        ending_membership[k] = (idx, set(active_numbers))
+                active_start = None
+                active_numbers = set()
+    return ending_membership
+
+def expand_repeats_with_volta(measures: List[ET.Element]) -> List[ET.Element]:
+    """
+    İleri/geri repeat ve ending (volta) destekli açılım.
+    DC/DS/Coda/Fine bu sürümde sadece uyarı verir.
+    """
     if not measures:
         return []
     ns = NS(measures[0])
-    expanded = []
+    ending_membership = parse_ending_ranges(measures, ns)
+
+    expanded: List[ET.Element] = []
     i = 0
-    forward_stack = []
-    repeat_count_map = {}  # i: kaç defa tekrar edildi
+
+    # Repeat frame yapısı: (start_idx, end_idx_or_None, pass_no, max_times)
+    frames: List[Tuple[int, Optional[int], int, int]] = []
+
+    safety = 0
     while i < len(measures):
+        safety += 1
+        if safety > 100000:
+            print("UYARI: Repeat açılımında güvenlik sınırı aşıldı, olası sonsuz döngü.", file=sys.stderr)
+            break
+
         m = measures[i]
+
+        # Karmaşık tekrar işaretleri için uyarı
+        for direction in m.findall(ns.tag('direction')):
+            sound = direction.find(ns.tag('sound'))
+            if sound is not None and (sound.get('dacapo') or sound.get('dalsegno') or sound.get('fine') or sound.get('tocoda') or sound.get('coda') or sound.get('segno')):
+                print(f"UYARI: DC/DS/Coda/Fine algılandı (ölçü {m.get('number','?')}); bu sürüm sadece ileri/geri repeat ve ending açar.", file=sys.stderr)
+
+        # Volta (ending) kontrolü: Eğer bir repeat çerçevesi içindeysek ve bu ending mevcut pass'a uymuyorsa atla
+        if frames:
+            end_tup = ending_membership.get(i)
+            if end_tup:
+                end_idx, ending_nums = end_tup
+                start_idx, end_idx_frame, pass_no, max_times = frames[-1]
+                # ending_nums boş ise her passta çalınır varsayalım
+                if ending_nums and (pass_no not in ending_nums):
+                    i = end_idx + 1
+                    continue
+
         expanded.append(m)
-        repeat_found = False
-        for barline in m.findall('.//'+ns.tag('barline')):
+
+        # Barline repeat işleme
+        forward_here = False
+        backward_here = False
+        backward_times = None
+
+        for barline in m.findall('.//' + ns.tag('barline')):
             repeat = barline.find(ns.tag('repeat'))
             if repeat is not None:
                 direction = repeat.get('direction')
                 if direction == 'forward':
-                    forward_stack.append(i)
-                elif direction == 'backward' and forward_stack:
-                    start = forward_stack[-1]
-                    # times özniteliği varsa (örn. 3x tekrar), ona göre aç
-                    times = repeat.get('times')
-                    times = int(times) if times and times.isdigit() else 2
-                    count = repeat_count_map.get((start, i), 1)
-                    if count < times:
-                        repeat_count_map[(start, i)] = count + 1
-                        i = start - 1  # tekrar başına gönder
-                        repeat_found = True
-        # Karmaşık tekrar için uyarı
-        for sound in m.findall('.//'+ns.tag('sound')):
-            if sound.get('dalsegno') or sound.get('dacapo') or sound.get('fine'):
-                print(f"UYARI: Karmaşık tekrar (DC/segno/fine) algılandı; script sadece basit repeat açar!", file=sys.stderr)
-        if not repeat_found:
-            i += 1
+                    forward_here = True
+                elif direction == 'backward':
+                    backward_here = True
+                    t = repeat.get('times')
+                    backward_times = int(t) if t and t.isdigit() else None
+
+        if forward_here:
+            frames.append((i, None, 1, 2))  # varsayılan 2 kez
+
+        if backward_here:
+            if frames:
+                start_idx, _, pass_no, max_times = frames[-1]
+                # times belirtilmişse kullan
+                if backward_times is not None:
+                    max_times = backward_times
+                if pass_no < max_times:
+                    frames[-1] = (start_idx, i, pass_no + 1, max_times)
+                    i = start_idx  # tekrar başına dön
+                    continue
+                else:
+                    # Çerçeveyi kapat ve devam et
+                    frames.pop()
+
+        i += 1
+
     return expanded
 
 def extract_measures(tree: ET.ElementTree) -> List[LinearMeasure]:
     root = tree.getroot()
     ns = NS(root)
     raw = collect_measures(root)
-    expanded = expand_repeats_basic(raw)
+    expanded = expand_repeats_with_volta(raw)
 
     linear: List[LinearMeasure] = []
-    current_dynamic = None
-    current_tempo = 120.0
-    current_divisions = 1
-    staff_time_beats = 0.0  # Sadece RH için
+    current_dynamic: Optional[str] = None
+    current_tempo: float = 120.0
+    current_divisions: int = 1
+
+    # Global zaman (beats ve seconds) ölçü başlarında ilerletilir
+    global_time_beats: float = 0.0
+    global_time_seconds: float = 0.0
 
     for lin_idx, m in enumerate(expanded):
         no_txt = m.get('number', '0')
@@ -146,12 +238,14 @@ def extract_measures(tree: ET.ElementTree) -> List[LinearMeasure]:
             meas_no = 0
         lm = LinearMeasure(linear_index=lin_idx, original_measure=meas_no)
 
+        # Ölçü başı attributes
         attr = m.find(ns.tag('attributes'))
         div_el = attr.find(ns.tag('divisions')) if attr is not None else None
-        if div_el is not None and div_el.text and div_el.text.isdigit():
+        if div_el is not None and (div_el.text or "").isdigit():
             current_divisions = int(div_el.text)
-        divisions = current_divisions
+        divisions = max(current_divisions, 1)
 
+        # Ölçü başında görülen direction'lar (tempo/dynamic)
         for direction in m.findall(ns.tag('direction')):
             dyn = dynamic_from_direction(direction, ns)
             if dyn:
@@ -162,71 +256,132 @@ def extract_measures(tree: ET.ElementTree) -> List[LinearMeasure]:
                 current_tempo = tmp
                 lm.tempo = tmp
 
-        for note in m.findall(ns.tag('note')):
-            staff_txt = note.findtext(ns.tag('staff'), default='1')
-            try:
-                staff = int(staff_txt)
-            except ValueError:
-                staff = 1
-            if staff != 1:
-                continue  # Sadece RH çıkar
+        # Ölçü içi akış: note/backup/forward/direction sırasını korumak için çocukları sırayla dolaş
+        cur_div_pos = 0  # ölçü içi pozisyon (divisions biriminde)
+        max_div_pos = 0
 
-            is_rest = note.find(ns.tag('rest')) is not None
-            duration_div = note.findtext(ns.tag('duration'))
-            grace = note.find(ns.tag('grace')) is not None
+        # Chord notalarının süre eklememesi için kontrol
+        def is_chord(note_el: ET.Element) -> bool:
+            return note_el.find(ns.tag('chord')) is not None
 
-            step = note.findtext(ns.tag('pitch')+'/'+ns.tag('step')) if not is_rest else None
-            alter = int(note.findtext(ns.tag('pitch')+'/'+ns.tag('alter'), default='0')) if step else 0
-            octave = int(note.findtext(ns.tag('pitch')+'/'+ns.tag('octave'))) if step else 0
+        for child in list(m):
+            tag = child.tag if ns.ns is None else child.tag
+            local = tag.split('}', 1)[-1] if '}' in tag else tag
 
-            if grace or not duration_div or not duration_div.isdigit():
-                dur_quarter = 0.0
+            if local == 'direction':
+                # Ölçü içinde tempo/dynamic değişebilir; beats tabanlı zaman çizgimiz değişmez,
+                # ama yine de bir sonraki olaylar için tempo/dynamic güncelleyelim.
+                dyn = dynamic_from_direction(child, ns)
+                if dyn:
+                    current_dynamic = dyn
+                    lm.new_dynamic = dyn
+                tmp = tempo_from_direction(child, ns)
+                if tmp:
+                    current_tempo = tmp
+                    lm.tempo = tmp
+
+            elif local == 'backup':
+                dur_txt = child.findtext(ns.tag('duration'))
+                if dur_txt and dur_txt.isdigit():
+                    cur_div_pos -= int(dur_txt)
+                    if cur_div_pos < 0:
+                        cur_div_pos = 0  # güvenlik
+                # max_div_pos değişmez
+
+            elif local == 'forward':
+                dur_txt = child.findtext(ns.tag('duration'))
+                if dur_txt and dur_txt.isdigit():
+                    cur_div_pos += int(dur_txt)
+                    if cur_div_pos > max_div_pos:
+                        max_div_pos = cur_div_pos
+
+            elif local == 'note':
+                # RH filtresi
+                staff_txt = child.findtext(ns.tag('staff'), default='1')
+                try:
+                    staff = int(staff_txt)
+                except ValueError:
+                    staff = 1
+
+                is_rest = child.find(ns.tag('rest')) is not None
+                dur_txt = child.findtext(ns.tag('duration'))
+                dur_div = int(dur_txt) if (dur_txt and dur_txt.isdigit()) else 0
+                chord_flag = is_chord(child)
+                grace = child.find(ns.tag('grace')) is not None
+
+                step = child.findtext(ns.tag('pitch') + '/' + ns.tag('step')) if not is_rest else None
+                alter = int(child.findtext(ns.tag('pitch') + '/' + ns.tag('alter'), default='0')) if step else 0
+                octave = int(child.findtext(ns.tag('pitch') + '/' + ns.tag('octave'))) if step else 0
+
+                # Olay zamanı (beats/saniye) ölçü başına global offset ile hesaplanır
+                ev_t_beats = global_time_beats + (cur_div_pos / divisions)
+                ev_d_beats = (dur_div / divisions)
+
+                if staff == 1:
+                    pitches_tr: List[str] = []
+                    pitches_sci: List[str] = []
+                    midi: List[int] = []
+                    if not is_rest and step is not None:
+                        pitches_tr.append(turkish_name(step, alter, octave))
+                        pitches_sci.append(sci_name(step, alter, octave))
+                        midi.append(midi_number(step, alter, octave))
+
+                    # Basit artikülasyonlar
+                    art: List[str] = []
+                    if child.find('.//' + ns.tag('staccato')) is not None: art.append("staccato")
+                    if child.find('.//' + ns.tag('accent'))   is not None: art.append("accent")
+                    if child.find('.//' + ns.tag('tenuto'))   is not None: art.append("tenuto")
+                    if child.find('.//' + ns.tag('strong-accent')) is not None: art.append("marcato")
+
+                    # Slur
+                    slur_start = False; slur_end = False
+                    for sl in child.findall('.//' + ns.tag('slur')):
+                        t = sl.get('type')
+                        if t == 'start': slur_start = True
+                        elif t == 'stop': slur_end = True
+
+                    ev = NoteEvent(
+                        t_beats=ev_t_beats,
+                        t_seconds=0.0,               # Geçici, ölçü sonunda güncellenecek
+                        dur_beats=ev_d_beats,
+                        dur_seconds=0.0,             # Geçici, ölçü sonunda güncellenecek
+                        pitches_tr=pitches_tr,
+                        pitches_sci=pitches_sci,
+                        midi=midi,
+                        dyn=current_dynamic,
+                        art=art,
+                        slur_start=slur_start,
+                        slur_end=slur_end,
+                        grace=grace,
+                    )
+                    lm.RH.append(ev)
+
+                # Zaman pozisyonu: chord notasıysa ilerleme yok; değilse duration kadar ilerle
+                if not chord_flag:
+                    cur_div_pos += dur_div
+                    if cur_div_pos > max_div_pos:
+                        max_div_pos = cur_div_pos
+
             else:
-                dur_quarter = int(duration_div)/divisions
-            dur_beats = dur_quarter
+                # diğer tag'lar yok sayılır
+                pass
 
-            start_beats = staff_time_beats
-            start_seconds = (60.0/current_tempo)*start_beats
+        # Ölçü süresi (beats) = max_div_pos / divisions
+        measure_beats = max_div_pos / divisions
 
-            pitches_tr = []; pitches_sci = []; midi = []
-            if not is_rest:
-                pitches_tr.append(turkish_name(step, alter, octave))
-                pitches_sci.append(sci_name(step, alter, octave))
-                midi.append(midi_number(step, alter, octave))
+        # Bu ölçüdeki RH olayları için t_seconds ve dur_seconds hesapla
+        # Basitleştirme: ölçü boyunca tek tempo varsayıyoruz (ölçü başı tempo)
+        for ev in lm.RH:
+            local_offset_beats = ev.t_beats - global_time_beats  # ölçü içi offset
+            ev.t_seconds = global_time_seconds + local_offset_beats * (60.0 / max(current_tempo, 1e-9))
+            ev.dur_seconds = ev.dur_beats * (60.0 / max(current_tempo, 1e-9))
 
-            articulation = []
-            if note.find('.//'+ns.tag('staccato')) is not None:
-                articulation.append("staccato")
-            if note.find('.//'+ns.tag('accent')) is not None:
-                articulation.append("accent")
-            if note.find('.//'+ns.tag('tenuto')) is not None:
-                articulation.append("tenuto")
-            if note.find('.//'+ns.tag('strong-accent')) is not None:
-                articulation.append("marcato")
-            slur_start = False; slur_end = False
-            for sl in note.findall('.//'+ns.tag('slur')):
-                t = sl.get('type')
-                if t == 'start': slur_start = True
-                elif t == 'stop': slur_end = True
+        # Bir sonraki ölçüye global zamanı ilerlet
+        global_time_seconds += measure_beats * (60.0 / max(current_tempo, 1e-9))
+        global_time_beats += measure_beats
 
-            ev = NoteEvent(
-                t_beats=start_beats,
-                t_seconds=start_seconds,
-                dur_beats=dur_beats,
-                dur_seconds=(60.0/current_tempo)*dur_beats,
-                pitches_tr=pitches_tr,
-                pitches_sci=pitches_sci,
-                midi=midi,
-                dyn=current_dynamic,
-                art=articulation,
-                slur_start=slur_start,
-                slur_end=slur_end,
-                grace=grace,
-            )
-            lm.RH.append(ev)
-            if not grace:
-                staff_time_beats = start_beats + dur_beats
         linear.append(lm)
+
     return linear
 
 def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
@@ -254,7 +409,7 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
 
     # TXT
     txt = [
-        "MusicXML Sağ El Transcript (RH only, repeat expanded)",
+        "MusicXML Sağ El Transcript (RH only, repeat+volta expanded, backup/forward aware)",
         f"Generated UTC: {now}",
         f"Linear measures: {len(measures)}",
         f"Events: {len(events)}",
@@ -271,7 +426,7 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
             'generated_utc': now,
             'measure_count': len(measures),
             'event_count': len(events),
-            'format_version': 5,
+            'format_version': 6,
             'script_version': __VERSION__,
         },
         'events': events
@@ -284,13 +439,13 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
 
     # Measure map
     map_lines = ["# Measure Map", "",
-               "| LinearIndex | OriginalMeasure | RH_events |",
-               "|------------:|---------------:|----------:|"]
+                 "| LinearIndex | OriginalMeasure | RH_events |",
+                 "|------------:|---------------:|----------:|"]
     for m in measures:
         map_lines.append(f"| {m.linear_index} | {m.original_measure} | {len(m.RH)} |")
     (out_dir/"measure_map_rh.md").write_text("\n".join(map_lines), encoding="utf-8")
 
-    # Lua exporter helpers
+    # Lua exporter
     def lua_list(values):
         if not values:
             return "{}"
@@ -303,7 +458,7 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
         return "{" + ",".join(formatted) + "}"
 
     lua_lines = [
-        "-- Auto-generated RH transcription table (repeat expanded)",
+        "-- Auto-generated RH transcription table (repeat+volta expanded, backup/forward aware)",
         f"-- Generated UTC: {now}",
         f"-- Script version: {__VERSION__}",
         "return {",
@@ -334,12 +489,12 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
     lua_lines.append("}")
     (out_dir/"transcript_rh.lua").write_text("\n".join(lua_lines), encoding="utf-8")
 
-    print(f"Wrote {len(events)} RH events across {len(measures)} measures.")
+    print(f"Wrote {len(events)} RH events across {len(measures)} expanded measures.")
 
 def main():
     if len(sys.argv) < 2:
         print("USAGE: python scripts/generate_transcript.py <input.musicxml>\n"
-              "Sadece sağ el (RH) çıkarılır. Repeat işaretleri açılır, müzik akışı orijinal gibi olur.\n"
+              "Sadece sağ el (RH) çıkarılır. Repeat+volta açılır; backup/forward akışı dikkate alınır.\n"
               "Çıktılar: transcript_rh.txt, .json, .lua, .abc, .md\n", file=sys.stderr)
         sys.exit(1)
     path = pathlib.Path(sys.argv[1])
