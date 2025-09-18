@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """
 MusicXML'den SADECE sağ el (RH, staff=1) notalarını çıkaran,
-repeat (ileri/geri) ve volta (1.,2. son) işaretlerini açan ve
-ölçü süresini time signature + divisions + tempo ile doğru hesaplayan script.
+repeat (ileri/geri) ve volta (1.,2. son) işaretlerini güvenle açan ve
+süre hesabını (time signature + tempo) güvenilir şekilde yapan script.
 
-- Müziğin gerçek çalınış sırasını bozmadan tekrarları genişletir (|: ... :| ve 1.,2. ending).
-- RH dışındaki içerik zaman hesabı için dikkate alınır (ölçü süresi doğru ilerler),
-  ama çıktıya sadece RH olayları yazılır.
-- Tempo: <sound tempo="..."> ve/veya <direction-type><metronome> desteklenir.
-- Ölçü süresi: Önce time signature'dan hesaplanır; içerik analizi ile bulunan süre bunu aşıyorsa clamp edilir.
-  Pickup (eksik) ölçüde içerik süresi kullanılır.
+- Müziğin gerçek akışını bozmadan tekrarları açar (|: ... :| ve 1.,2. ending).
+- Ölçü süresi: Time signature varsa doğrudan ondan alınır (örn. 4/4 → 4 beat).
+- Tempo: <sound tempo="..."> ve <metronome> desteklenir; metronom dönüşümü düzeltildi.
+- Güvenlik: Aşırı büyüme tespitinde açılımı durdurur ve uyarı verir (sonsuz döngü önleme).
 
 USAGE:
-    python scripts/generate_transcript.py <input.musicxml> [LIMIT]
-      LIMIT: all/-1 => tümü, yoksa/pozitif => ilk N ölçü (repeat genişletildikten sonra)
+  python scripts/generate_transcript.py <input.musicxml> [LIMIT]
+    LIMIT: all/-1 => tümü; pozitif sayı => ilk N ölçü (repeat açılımından sonra)
 
 Outputs:
-    transcript_full.txt, transcript_full.json, transcript_full.lua, transcript_full.abc, measure_map.md
+  transcript_full.txt, transcript_full.json, transcript_full.lua, transcript_full.abc, measure_map.md
 """
 
 import sys
@@ -27,7 +25,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict, Set
 
-__VERSION__ = "0.7.0"
+__VERSION__ = "0.8.0"
 
 DYNAMIC_TAGS = ["ppp","pp","p","mp","mf","f","ff","fff","fp","sfz"]
 LETTER_TO_TURKISH = {"C":"Do","D":"Re","E":"Mi","F":"Fa","G":"Sol","A":"La","B":"Si"}
@@ -95,7 +93,7 @@ def tempo_from_direction(direction_el: ET.Element, ns: NS) -> Optional[float]:
             return float(sound.get('tempo'))
         except ValueError:
             pass
-    # 2) <direction-type><metronome><beat-unit>...</beat-unit><per-minute>...</per-minute>
+    # 2) <direction-type><metronome>
     dtyp = direction_el.find(ns.tag('direction-type')) if direction_el is not None else None
     if dtyp is not None:
         metro = dtyp.find(ns.tag('metronome'))
@@ -107,12 +105,12 @@ def tempo_from_direction(direction_el: ET.Element, ns: NS) -> Optional[float]:
             except ValueError:
                 per_minute = None
             if per_minute:
-                # beat-unit'i çeyreğe çevir
-                unit_map = {
-                    'whole': 1/4.0, 'half': 1/2.0, 'quarter': 1.0,
-                    'eighth': 2.0, '16th': 4.0, '32nd': 8.0, '64th': 16.0
+                # beat-unit'i çeyreğe çevir: quarter BPM = per_minute * (beat_unit_length_in_quarters)
+                unit_to_quarter = {
+                    'whole': 4.0, 'half': 2.0, 'quarter': 1.0,
+                    'eighth': 0.5, '16th': 0.25, '32nd': 0.125, '64th': 0.0625
                 }
-                factor = unit_map.get(beat_unit, 1.0)  # bilinmiyorsa çeyrek varsay
+                factor = unit_to_quarter.get(beat_unit, 1.0)
                 return per_minute * factor
     return None
 
@@ -132,6 +130,7 @@ def parse_ending_ranges(measures: List[ET.Element], ns: NS) -> Dict[int, Tuple[i
         if not text:
             return set()
         nums = set()
+        # örn: "1", "1,2", "1 2"
         for part in text.replace(',', ' ').split():
             if part.isdigit():
                 nums.add(int(part))
@@ -166,28 +165,22 @@ def expand_repeats_with_volta(measures: List[ET.Element]) -> List[ET.Element]:
     frames: List[Tuple[int, Optional[int], int, int]] = []  # (start_idx, end_idx, pass_no, max_times)
 
     safety_steps = 0
-    max_steps = 200000  # güvenlik
+    max_steps = max(20000, len(measures) * 50)  # güvenlik: orijinalin 50 katını aşma
 
     while i < len(measures):
         safety_steps += 1
         if safety_steps > max_steps:
-            print("UYARI: Repeat açılımında güvenlik sınırı aşıldı, olası döngü. Açılım durduruldu.", file=sys.stderr)
+            print(f"UYARI: Repeat açılımı güvenlik sınırını aştı ({safety_steps} adım). Açılım durduruldu.", file=sys.stderr)
             break
 
         m = measures[i]
 
-        # Karmaşık işaretler uyarısı (uygulamıyoruz)
-        for direction in m.findall(ns.tag('direction')):
-            sound = direction.find(ns.tag('sound'))
-            if sound is not None and (sound.get('dacapo') or sound.get('dalsegno') or sound.get('fine') or sound.get('tocoda') or sound.get('coda') or sound.get('segno')):
-                print(f"UYARI: DC/DS/Coda/Fine algılandı (ölçü {m.get('number','?')}); bu sürüm sadece ileri/geri repeat ve ending açar.", file=sys.stderr)
-
-        # Volta uygun değilse atla
+        # Volta: geçerli pass içinde değilse bu ending bloğunu atla
         if frames:
             end_tup = ending_membership.get(i)
             if end_tup:
                 end_idx, ending_nums = end_tup
-                start_idx, end_idx_frame, pass_no, max_times = frames[-1]
+                start_idx, _, pass_no, _ = frames[-1]
                 if ending_nums and (pass_no not in ending_nums):
                     i = end_idx + 1
                     continue
@@ -211,24 +204,24 @@ def expand_repeats_with_volta(measures: List[ET.Element]) -> List[ET.Element]:
                         backward_times = int(t)
 
         if forward_here:
-            frames.append((i, None, 1, backward_times or 2))  # şimdilik varsayılan 2
+            # Yeni repeat çerçevesi aç
+            frames.append((i, None, 1, backward_times or 2))  # varsayılan 2
 
-        if backward_here:
-            if frames:
-                start_idx, _, pass_no, max_times = frames[-1]
-                if backward_times is not None:
-                    max_times = backward_times
-                if pass_no < max_times:
-                    frames[-1] = (start_idx, i, pass_no + 1, max_times)
-                    i = start_idx
-                    continue
-                else:
-                    frames.pop()
+        if backward_here and frames:
+            # En son açılan çerçeveyi işlet
+            start_idx, _, pass_no, max_times = frames[-1]
+            if backward_times is not None:
+                max_times = backward_times
+            if pass_no < max_times:
+                frames[-1] = (start_idx, i, pass_no + 1, max_times)
+                i = start_idx  # tekrar başına dön
+                continue
+            else:
+                frames.pop()
 
         i += 1
 
-    # Aşırı büyümeyi tespit et ve uyar
-    if len(expanded) > max(1, len(measures)) * 20:
+    if len(expanded) > max(1, len(measures)) * 30:
         print(f"UYARI: Repeat açılımı sıra dışı büyük: {len(measures)} -> {len(expanded)} ölçü. İşaretleri kontrol edin.", file=sys.stderr)
 
     return expanded
@@ -252,10 +245,14 @@ def extract_measures(tree: ET.ElementTree, limit: Optional[int]=None) -> List[Li
     global_time_seconds: float = 0.0
 
     for lin_idx, m in enumerate(expanded):
-        lm = LinearMeasure(
-            linear_index=lin_idx,
-            original_measure=int(m.get('number', '0')) if (m.get('number','0').lstrip('-').isdigit()) else 0
-        )
+        # Ölçü numarası
+        no_txt = m.get('number', '0')
+        try:
+            meas_no = int(no_txt)
+        except ValueError:
+            meas_no = 0
+
+        lm = LinearMeasure(linear_index=lin_idx, original_measure=meas_no)
 
         # Attributes
         attr = m.find(ns.tag('attributes'))
@@ -267,13 +264,13 @@ def extract_measures(tree: ET.ElementTree, limit: Optional[int]=None) -> List[Li
                 pass
         divisions = max(current_divisions, 1)
 
-        # Time signature
+        # Time signature (ölçü süresi doğrudan buradan alınır)
         beats = None
         beat_type = None
-        time_el = attr.find(ns.tag('time')) if attr is not None else None
-        if time_el is not None:
-            beats_txt = time_el.findtext(ns.tag('beats'))
-            beat_type_txt = time_el.findtext(ns.tag('beat-type'))
+        ts_el = attr.find(ns.tag('time')) if attr is not None else None
+        if ts_el is not None:
+            beats_txt = ts_el.findtext(ns.tag('beats'))
+            beat_type_txt = ts_el.findtext(ns.tag('beat-type'))
             if beats_txt and beats_txt.isdigit() and beat_type_txt and beat_type_txt.isdigit():
                 beats = int(beats_txt)
                 beat_type = int(beat_type_txt)
@@ -286,57 +283,34 @@ def extract_measures(tree: ET.ElementTree, limit: Optional[int]=None) -> List[Li
                 lm.new_dynamic = dyn
             tmp = tempo_from_direction(direction, ns)
             if tmp:
-                # Aşırı uç tempo değerlerine karşı min/max sınır (güvenlik)
-                if 10.0 <= tmp <= 400.0:
-                    current_tempo = tmp
-                else:
-                    # olağan dışı tempo tespitinde uyar ama yine de clamp et
-                    print(f"UYARI: Olağan dışı tempo {tmp} BPM; {max(min(tmp,400.0),10.0)} BPM'e clamp edildi.", file=sys.stderr)
-                    current_tempo = max(min(tmp, 400.0), 10.0)
+                # 10-400 BPM aralığına clamp
+                if tmp < 10.0 or tmp > 400.0:
+                    print(f"UYARI: Olağan dışı tempo {tmp} BPM; clamp edildi.", file=sys.stderr)
+                current_tempo = min(max(tmp, 10.0), 400.0)
                 lm.tempo = current_tempo
 
-        # Ölçü içi akış: position (div) ve maksimum pozisyon
+        # Ölçü uzunluğu (beats): Time signature varsa TS bazlı, yoksa içerikten tahmin
+        # TS varsa: beats * (4/beat_type). Yoksa: içerikteki maksimum konumdan tahmin.
         cur_div_pos = 0
         max_div_pos = 0
 
         def is_chord(note_el: ET.Element) -> bool:
             return note_el.find(ns.tag('chord')) is not None
 
-        # Çocukları sırayla gez: note/backup/forward/direction
+        # İçeriği sadece RH olaylarını toplamak ve içerik-tahmin süresini görmek için dolaş
         for child in list(m):
             local = child.tag.split('}', 1)[-1] if '}' in child.tag else child.tag
-
-            if local == 'direction':
-                # Ölçü ortasında tempo/dynamic değişebilir (saniyeye çevrimde kaba bir yaklaşım kullanıyoruz)
-                dyn = dynamic_from_direction(child, ns)
-                if dyn:
-                    current_dynamic = dyn
-                    lm.new_dynamic = dyn
-                tmp = tempo_from_direction(child, ns)
-                if tmp:
-                    if 10.0 <= tmp <= 400.0:
-                        current_tempo = tmp
-                    else:
-                        print(f"UYARI: Olağan dışı tempo {tmp} BPM (ölçü içi); clamp edildi.", file=sys.stderr)
-                        current_tempo = max(min(tmp, 400.0), 10.0)
-                    lm.tempo = current_tempo
-
-            elif local == 'backup':
+            if local == 'backup':
                 dur_txt = child.findtext(ns.tag('duration'))
                 if dur_txt and dur_txt.isdigit():
-                    cur_div_pos -= int(dur_txt)
-                    if cur_div_pos < 0:
-                        cur_div_pos = 0
-
+                    cur_div_pos = max(0, cur_div_pos - int(dur_txt))
             elif local == 'forward':
                 dur_txt = child.findtext(ns.tag('duration'))
                 if dur_txt and dur_txt.isdigit():
                     cur_div_pos += int(dur_txt)
-                    if cur_div_pos > max_div_pos:
-                        max_div_pos = cur_div_pos
-
+                    max_div_pos = max(max_div_pos, cur_div_pos)
             elif local == 'note':
-                # Staff filtresi
+                # RH filtre
                 staff_txt = child.findtext(ns.tag('staff'), default='1')
                 try:
                     staff = int(staff_txt)
@@ -353,11 +327,10 @@ def extract_measures(tree: ET.ElementTree, limit: Optional[int]=None) -> List[Li
                 alter = int(child.findtext(ns.tag('pitch') + '/' + ns.tag('alter'), default='0')) if step else 0
                 octave = int(child.findtext(ns.tag('pitch') + '/' + ns.tag('octave'))) if step else 0
 
-                # Olay zamanı ölçü başlangıcına göre (beat)
-                ev_t_beats = global_time_beats + (cur_div_pos / divisions)
-                ev_d_beats = (dur_div / divisions)
-
+                # RH olayı oluştur
                 if staff == 1:
+                    ev_t_beats = global_time_beats + (cur_div_pos / divisions)
+                    ev_d_beats = (dur_div / divisions)
                     pitches_tr: List[str] = []
                     pitches_sci: List[str] = []
                     midi: List[int] = []
@@ -366,76 +339,58 @@ def extract_measures(tree: ET.ElementTree, limit: Optional[int]=None) -> List[Li
                         pitches_sci.append(sci_name(step, alter, octave))
                         midi.append(midi_number(step, alter, octave))
 
-                    # Artikülasyon
                     art: List[str] = []
                     if child.find('.//' + ns.tag('staccato')) is not None: art.append("staccato")
                     if child.find('.//' + ns.tag('accent'))   is not None: art.append("accent")
                     if child.find('.//' + ns.tag('tenuto'))   is not None: art.append("tenuto")
                     if child.find('.//' + ns.tag('strong-accent')) is not None: art.append("marcato")
 
-                    # Slur
                     slur_start = False; slur_end = False
                     for sl in child.findall('.//' + ns.tag('slur')):
                         t = sl.get('type')
                         if t == 'start': slur_start = True
                         elif t == 'stop': slur_end = True
 
-                    ev = NoteEvent(
-                        t_beats=ev_t_beats,
-                        t_seconds=0.0,               # sonra hesaplanacak
-                        dur_beats=ev_d_beats,
-                        dur_seconds=0.0,             # sonra hesaplanacak
-                        pitches_tr=pitches_tr,
-                        pitches_sci=pitches_sci,
-                        midi=midi,
-                        dyn=current_dynamic,
-                        art=art,
-                        slur_start=slur_start,
-                        slur_end=slur_end,
-                        grace=grace,
-                    )
-                    lm.RH.append(ev)
+                    lm.RH.append(NoteEvent(
+                        t_beats=ev_t_beats, t_seconds=0.0,
+                        dur_beats=ev_d_beats, dur_seconds=0.0,
+                        pitches_tr=pitches_tr, pitches_sci=pitches_sci, midi=midi,
+                        dyn=current_dynamic, art=art,
+                        slur_start=slur_start, slur_end=slur_end, grace=grace
+                    ))
 
-                # chord olmayan notalarda pozisyonu ilerlet
+                # chord değilse pozisyonu ilerlet
                 if not chord_flag:
                     cur_div_pos += dur_div
-                    if cur_div_pos > max_div_pos:
-                        max_div_pos = cur_div_pos
+                    max_div_pos = max(max_div_pos, cur_div_pos)
 
-        # Ölçü süresi (beats)
-        content_beats = max_div_pos / divisions if divisions else 0.0
-        ts_beats = None
+        # Ölçü süresi (beats):
         if beats and beat_type:
-            ts_beats = beats * (4.0 / float(beat_type))
-
-        # Clamp mantığı:
-        # - time signature varsa, measure_beats = min(content_beats>0 ? content_beats : ts_beats, ts_beats)
-        # - yoksa content_beats
-        if ts_beats is not None:
-            if content_beats > 0:
-                measure_beats = min(content_beats, ts_beats + 1e-9)  # çok küçük tolerans
-            else:
-                measure_beats = ts_beats
+            measure_beats = beats * (4.0 / float(beat_type))
         else:
-            measure_beats = content_beats
+            measure_beats = max_div_pos / divisions if divisions else 0.0
 
-        # RH olayları için saniye hesabı (ölçü başı tempo ile)
+        # Ölçü başı tempo ile saniyeye çevir
         sec_per_beat = 60.0 / max(current_tempo, 1e-6)
         for ev in lm.RH:
             local_offset = ev.t_beats - global_time_beats
             ev.t_seconds = global_time_seconds + local_offset * sec_per_beat
             ev.dur_seconds = ev.dur_beats * sec_per_beat
 
-        # Global zaman ilerlet
+        # Global zamanı ilerlet
         global_time_seconds += measure_beats * sec_per_beat
         global_time_beats += measure_beats
         lm.measure_beats = measure_beats
 
         linear.append(lm)
 
-    # Toplam süre çıktı (debug)
+    # Toplam info
     print(f"[INFO] Expanded measures: {len(expanded)} (raw: {len(raw)})", file=sys.stderr)
     print(f"[INFO] Total duration (s): {global_time_seconds:.3f}", file=sys.stderr)
+
+    # Aşırı uzun süre uyarısı
+    if len(raw) > 0 and global_time_seconds > 3600:  # 1 saatten uzun ise uyar
+        print(f"UYARI: Toplam süre olağan dışı uzun görünüyor ({global_time_seconds:.1f} s). Repeat işaretlerini ve tempo/metronomu kontrol edin.", file=sys.stderr)
 
     return linear
 
@@ -464,7 +419,7 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
 
     # TXT
     txt = [
-        "MusicXML Transcript (RH only, repeat+volta expanded, TS-clamped)",
+        "MusicXML Transcript (RH only, repeat+volta expanded, TS-based measure length)",
         f"Generated UTC: {now}",
         f"Linear measures: {len(measures)}",
         f"Events: {len(events)}",
@@ -481,7 +436,7 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
             'generated_utc': now,
             'measure_count': len(measures),
             'event_count': len(events),
-            'format_version': 7,
+            'format_version': 8,
             'script_version': __VERSION__,
         },
         'events': events
@@ -513,7 +468,7 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
         return "{" + ",".join(formatted) + "}"
 
     lua_lines = [
-        "-- Auto-generated RH transcription table (repeat+volta expanded, TS-clamped)",
+        "-- Auto-generated RH transcription table (repeat+volta expanded, TS-based measure length)",
         f"-- Generated UTC: {now}",
         f"-- Script version: {__VERSION__}",
         "return {",
