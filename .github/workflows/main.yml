@@ -15,18 +15,23 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: gen-txt-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   gen-txt:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # rebase için tam geçmiş alınır
 
       - name: Python kur
         uses: actions/setup-python@v5
         with:
           python-version: "3.x"
-          cache: "pip"
 
       - name: (Opsiyonel) Bağımlılık yükle
         if: hashFiles('requirements.txt') != ''
@@ -109,7 +114,6 @@ jobs:
             echo "HATA: OUT_TXT boş." >&2
             exit 1
           fi
-          # Sadece TXT commitlenecek (isteğe göre genişletilebilir)
           if [ -n "$(git status --porcelain "$OUT_TXT")" ]; then
             echo "changed=true" >> $GITHUB_OUTPUT
             echo "$OUT_TXT değişmiş."
@@ -118,16 +122,29 @@ jobs:
             echo "Değişiklik yok (commit atlanacak)."
           fi
 
-      - name: Commit & push
+      - name: Commit & push (rebase ile)
         if: steps.diffcheck.outputs.changed == 'true' && github.event.inputs.commit == 'true'
         run: |
-          set -e
+          set -euo pipefail
           OUT_TXT="${{ steps.runscript.outputs.out_txt }}"
+          BRANCH="${GITHUB_REF_NAME:-main}"
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Uzak değişiklikleri içeri al (rebase)
+          git fetch origin "$BRANCH"
+          git pull --rebase origin "$BRANCH"
+
           git add "$OUT_TXT"
+          # Boş commit olmasın
+          if git diff --cached --quiet; then
+            echo "Stage'de değişiklik yok, commit atlanıyor."
+            exit 0
+          fi
+
           git commit -m "chore: auto-generate ${OUT_TXT} (limit=${{ github.event.inputs.limit }})"
-          git push
+          git push origin "$BRANCH"
           echo "Commit ve push tamam."
 
       - name: Artifact yükle
