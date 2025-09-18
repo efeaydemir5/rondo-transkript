@@ -26,19 +26,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # rebase için tam geçmiş alınır
+          fetch-depth: 0
+
+      # Rebase/push hatalarını önlemek için önce senkronize ol
+      - name: Sync main (hard reset)
+        run: |
+          set -e
+          git fetch origin main
+          git reset --hard origin/main
 
       - name: Python kur
         uses: actions/setup-python@v5
         with:
           python-version: "3.x"
 
-      - name: (Opsiyonel) Bağımlılık yükle
-        if: hashFiles('requirements.txt') != ''
-        run: |
-          pip install -r requirements.txt
-
-      - name: Önce eski çıktıları temizle
+      - name: Eski çıktıları temizle
         run: |
           set -e
           rm -f transcript_*.txt transcript_*.json transcript_*.lua transcript_*.abc measure_map_*.md playback_order.txt || true
@@ -54,54 +56,41 @@ jobs:
       - name: Script çalıştır
         id: runscript
         env:
-          DEBUG_PLAYBACK: "1"               # ilk ~500 adım için debug izleri
-          REPEAT_REAPPLY_ON_RETURN: "0"     # DC/DS dönüşünde repeat'leri global limit ile sınırla
+          DEBUG_PLAYBACK: "1"
+          OBSERVE_REPEATS_AFTER_RETURN: "1"   # D.C./D.S. dönüşünden sonra repeat’leri uygula
         run: |
           set -euo pipefail
-          echo "Script ve MusicXML otomatik tespiti..."
           SCRIPT_PATH=$(find . -maxdepth 6 -type f -name "generate_transcript.py" | head -n1 || true)
           if [ -z "${SCRIPT_PATH}" ]; then
-            echo "HATA: generate_transcript.py bulunamadı. scripts/ klasörünün gerçekten commit edildiğinden emin ol." >&2
+            echo "HATA: generate_transcript.py bulunamadı." >&2
             exit 1
           fi
           MUSICXML_PATH=$(find . -maxdepth 6 -type f -name "HAHA.musicxml" | head -n1 || true)
           if [ -z "${MUSICXML_PATH}" ]; then
-            echo "HATA: HAHA.musicxml bulunamadı (repo köküne ya da alt dizinlerden birine ekleyin)." >&2
+            echo "HATA: HAHA.musicxml bulunamadı." >&2
             exit 1
           fi
 
-          echo "Bulunan script   : ${SCRIPT_PATH}"
-          echo "Bulunan MusicXML : ${MUSICXML_PATH}"
-          echo "Limit (girdi)    : ${{ github.event.inputs.limit }}"
+          echo "Script   : ${SCRIPT_PATH}"
+          echo "MusicXML : ${MUSICXML_PATH}"
+          echo "Limit    : ${{ github.event.inputs.limit }}"
 
           python "${SCRIPT_PATH}" "${MUSICXML_PATH}" "${{ github.event.inputs.limit }}"
 
-          # Olası çıktı dosyaları
-          CANDIDATES=("transcript_rh.txt" "transcript_full.txt")
-          OUT_TXT=""
-          for f in "${CANDIDATES[@]}"; do
-            if [ -f "$f" ]; then
-              OUT_TXT="$f"
-              break
-            fi
-          done
-
-          if [ -z "$OUT_TXT" ]; then
-            echo "HATA: Beklenen çıktı dosyası bulunamadı. Script hangi ada yazıyor kontrol edin (transcript_rh.txt veya transcript_full.txt)." >&2
+          # Beklenen çıktı
+          OUT_TXT="transcript_rh.txt"
+          if [ ! -f "$OUT_TXT" ]; then
+            echo "HATA: transcript_rh.txt bulunamadı." >&2
             ls -al
             exit 2
           fi
 
           echo "Çıktı dosyası: $OUT_TXT"
-          echo "---- ${OUT_TXT} (ilk 25 satır) ----"
           head -n 25 "$OUT_TXT" || true
-          echo "-----------------------------------"
 
-          # playback_order varsa ilk 50 satırı göster
           if [ -f playback_order.txt ]; then
             echo "---- playback_order.txt (ilk 50 satır) ----"
             head -n 50 playback_order.txt || true
-            echo "-------------------------------------------"
           fi
 
           echo "out_txt=${OUT_TXT}" >> $GITHUB_OUTPUT
@@ -110,41 +99,22 @@ jobs:
         id: diffcheck
         run: |
           OUT_TXT="${{ steps.runscript.outputs.out_txt }}"
-          if [ -z "$OUT_TXT" ]; then
-            echo "HATA: OUT_TXT boş." >&2
-            exit 1
-          fi
           if [ -n "$(git status --porcelain "$OUT_TXT")" ]; then
             echo "changed=true" >> $GITHUB_OUTPUT
-            echo "$OUT_TXT değişmiş."
           else
             echo "changed=false" >> $GITHUB_OUTPUT
-            echo "Değişiklik yok (commit atlanacak)."
           fi
 
-      - name: Commit & push (rebase ile)
+      - name: Commit & push
         if: steps.diffcheck.outputs.changed == 'true' && github.event.inputs.commit == 'true'
         run: |
-          set -euo pipefail
+          set -e
           OUT_TXT="${{ steps.runscript.outputs.out_txt }}"
-          BRANCH="${GITHUB_REF_NAME:-main}"
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # Uzak değişiklikleri içeri al (rebase)
-          git fetch origin "$BRANCH"
-          git pull --rebase origin "$BRANCH"
-
           git add "$OUT_TXT"
-          # Boş commit olmasın
-          if git diff --cached --quiet; then
-            echo "Stage'de değişiklik yok, commit atlanıyor."
-            exit 0
-          fi
-
           git commit -m "chore: auto-generate ${OUT_TXT} (limit=${{ github.event.inputs.limit }})"
-          git push origin "$BRANCH"
+          git push origin main
           echo "Commit ve push tamam."
 
       - name: Artifact yükle
