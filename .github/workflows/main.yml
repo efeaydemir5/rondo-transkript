@@ -26,22 +26,31 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.x"
+          cache: "pip"
 
       - name: (Opsiyonel) Bağımlılık yükle
         if: hashFiles('requirements.txt') != ''
         run: |
           pip install -r requirements.txt
 
+      - name: Önce eski çıktıları temizle
+        run: |
+          set -e
+          rm -f transcript_*.txt transcript_*.json transcript_*.lua transcript_*.abc measure_map_*.md playback_order.txt || true
+
       - name: Yapı / Debug liste
         run: |
           set -e
           echo "Çalışma dizini (pwd):"; pwd
           echo "--- Root içerik ---"; ls -al
-          echo "--- İlk 3 seviye (script ve xml araması) ---"
-          find . -maxdepth 3 -type f \( -name "generate_transcript.py" -o -name "HAHA.musicxml" \)
+          echo "--- İlk 6 seviye (script ve xml araması) ---"
+          find . -maxdepth 6 -type f \( -name "generate_transcript.py" -o -name "HAHA.musicxml" \)
 
       - name: Script çalıştır
         id: runscript
+        env:
+          DEBUG_PLAYBACK: "1"               # ilk ~500 adım için debug izleri
+          REPEAT_REAPPLY_ON_RETURN: "0"     # DC/DS dönüşünde repeat'leri global limit ile sınırla
         run: |
           set -euo pipefail
           echo "Script ve MusicXML otomatik tespiti..."
@@ -60,12 +69,9 @@ jobs:
           echo "Bulunan MusicXML : ${MUSICXML_PATH}"
           echo "Limit (girdi)    : ${{ github.event.inputs.limit }}"
 
-          # Limit parametresi destekleyen eski script için:
-          # - all veya -1 tam parça
-          # Limit parametresini okumayan yeni scriptler için ek argüman zararsızdır (yok sayılır).
           python "${SCRIPT_PATH}" "${MUSICXML_PATH}" "${{ github.event.inputs.limit }}"
 
-          # Olası çıktı dosya adları
+          # Olası çıktı dosyaları
           CANDIDATES=("transcript_rh.txt" "transcript_full.txt")
           OUT_TXT=""
           for f in "${CANDIDATES[@]}"; do
@@ -86,6 +92,13 @@ jobs:
           head -n 25 "$OUT_TXT" || true
           echo "-----------------------------------"
 
+          # playback_order varsa ilk 50 satırı göster
+          if [ -f playback_order.txt ]; then
+            echo "---- playback_order.txt (ilk 50 satır) ----"
+            head -n 50 playback_order.txt || true
+            echo "-------------------------------------------"
+          fi
+
           echo "out_txt=${OUT_TXT}" >> $GITHUB_OUTPUT
 
       - name: Değişiklik kontrol
@@ -96,6 +109,7 @@ jobs:
             echo "HATA: OUT_TXT boş." >&2
             exit 1
           fi
+          # Sadece TXT commitlenecek (isteğe göre genişletilebilir)
           if [ -n "$(git status --porcelain "$OUT_TXT")" ]; then
             echo "changed=true" >> $GITHUB_OUTPUT
             echo "$OUT_TXT değişmiş."
@@ -119,6 +133,8 @@ jobs:
       - name: Artifact yükle
         uses: actions/upload-artifact@v4
         with:
-          name: transcript_txt
-          path: ${{ steps.runscript.outputs.out_txt }}
-          if-no-files-found: error
+          name: transcripts
+          path: |
+            ${{ steps.runscript.outputs.out_txt }}
+            playback_order.txt
+          if-no-files-found: warn
