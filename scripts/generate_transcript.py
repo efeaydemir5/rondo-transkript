@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
 MusicXML'den SADECE sağ el (RH, staff=1) notalarını çıkaran,
-repeat (ileri/geri) ve volta (1.,2. son) işaretlerini güvenle açan ve
-süre hesabını (time signature + tempo) güvenilir şekilde yapan script.
+eşleştirilmiş repeat (|: :|) + volta (1.,2. ending) açılımını deterministik yapan
+ve süre hesabını (TS + tempo) güvenli şekilde hesaplayan script.
 
-- Müziğin gerçek akışını bozmadan tekrarları açar (|: ... :| ve 1.,2. ending).
-- Ölçü süresi: Time signature varsa doğrudan ondan alınır (örn. 4/4 → 4 beat).
-- Tempo: <sound tempo="..."> ve <metronome> desteklenir; metronom dönüşümü düzeltildi.
-- Güvenlik: Aşırı büyüme tespitinde açılımı durdurur ve uyarı verir (sonsuz döngü önleme).
+Notlar:
+- Repeat eşleştirme ön taramada yapılır; eşleşmeyen forward repeat'ler yok sayılır.
+- Volta ending, aktif repeat pass numarasına göre atlanır.
+- DC/DS/Coda/Fine uygulanmaz (uyarı verir).
+- Ölçü süresi TS tabanlıdır; tempo <sound tempo> ve <metronome> desteklenir.
 
 USAGE:
   python scripts/generate_transcript.py <input.musicxml> [LIMIT]
     LIMIT: all/-1 => tümü; pozitif sayı => ilk N ölçü (repeat açılımından sonra)
 
 Outputs:
-  transcript_full.txt, transcript_full.json, transcript_full.lua, transcript_full.abc, measure_map.md
+  transcript_rh.txt, transcript_rh.json, transcript_rh.lua, transcript_rh.abc, measure_map_rh.md
 """
-
 import sys
 import json
 import datetime
@@ -25,7 +25,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict, Set
 
-__VERSION__ = "0.8.0"
+__VERSION__ = "0.9.0"
 
 DYNAMIC_TAGS = ["ppp","pp","p","mp","mf","f","ff","fff","fp","sfz"]
 LETTER_TO_TURKISH = {"C":"Do","D":"Re","E":"Mi","F":"Fa","G":"Sol","A":"La","B":"Si"}
@@ -105,7 +105,7 @@ def tempo_from_direction(direction_el: ET.Element, ns: NS) -> Optional[float]:
             except ValueError:
                 per_minute = None
             if per_minute:
-                # beat-unit'i çeyreğe çevir: quarter BPM = per_minute * (beat_unit_length_in_quarters)
+                # beat-unit'i quarter BPM'e çevir
                 unit_to_quarter = {
                     'whole': 4.0, 'half': 2.0, 'quarter': 1.0,
                     'eighth': 0.5, '16th': 0.25, '32nd': 0.125, '64th': 0.0625
@@ -121,120 +121,140 @@ def collect_measures(root: ET.Element) -> List[ET.Element]:
         return []
     return list(part.findall(ns.tag('measure')))
 
-def parse_ending_ranges(measures: List[ET.Element], ns: NS) -> Dict[int, Tuple[int, Set[int]]]:
+def parse_endings(measures: List[ET.Element], ns: NS) -> Dict[int, Tuple[int, Set[int]]]:
+    # ending_membership[i] = (end_idx, {1,2,...})
     ending_membership: Dict[int, Tuple[int, Set[int]]] = {}
     active_start = None
-    active_numbers: Set[int] = set()
+    active_nums: Set[int] = set()
 
-    def parse_numbers(text: Optional[str]) -> Set[int]:
-        if not text:
-            return set()
-        nums = set()
-        # örn: "1", "1,2", "1 2"
-        for part in text.replace(',', ' ').split():
-            if part.isdigit():
-                nums.add(int(part))
-        return nums
+    def parse_numbers(s: Optional[str]) -> Set[int]:
+        if not s: return set()
+        out: Set[int] = set()
+        for p in s.replace(',', ' ').split():
+            if p.isdigit():
+                out.add(int(p))
+        return out
 
     for idx, m in enumerate(measures):
         for barline in m.findall('.//' + ns.tag('barline')):
             ending = barline.find(ns.tag('ending'))
             if ending is None:
                 continue
-            etype = ending.get('type')  # start, stop, discontinue
-            numbers = parse_numbers(ending.get('number'))
+            etype = ending.get('type')
+            nums = parse_numbers(ending.get('number'))
             if etype == 'start':
                 active_start = idx
-                active_numbers = numbers if numbers else set()
+                active_nums = nums
             elif etype in ('stop', 'discontinue'):
                 if active_start is not None:
                     for k in range(active_start, idx + 1):
-                        ending_membership[k] = (idx, set(active_numbers))
+                        ending_membership[k] = (idx, set(active_nums))
                 active_start = None
-                active_numbers = set()
+                active_nums = set()
     return ending_membership
 
-def expand_repeats_with_volta(measures: List[ET.Element]) -> List[ET.Element]:
+def pair_repeats(measures: List[ET.Element]) -> Tuple[Dict[int, Tuple[int,int]], Dict[int, Tuple[int,int]]]:
+    """
+    Repeat eşleştirme: forward (start_idx) -> (end_idx, times), backward (end_idx) -> (start_idx, times)
+    Eşleşmeyen forward'lar yok sayılır.
+    """
+    if not measures:
+        return {}, {}
+    ns = NS(measures[0])
+    stack: List[int] = []
+    start_to_pair: Dict[int, Tuple[int,int]] = {}
+    end_to_pair: Dict[int, Tuple[int,int]] = {}
+
+    for i, m in enumerate(measures):
+        # Bu ölçüdeki tüm barline'ları dolaş (ilgili direction'lar ayrı)
+        for barline in m.findall('.//' + ns.tag('barline')):
+            repeat = barline.find(ns.tag('repeat'))
+            if repeat is None:
+                continue
+            direction = repeat.get('direction')
+            if direction == 'forward':
+                stack.append(i)
+            elif direction == 'backward':
+                if not stack:
+                    continue  # eşleşecek forward yok, yok say
+                start = stack.pop()
+                times_attr = repeat.get('times')
+                times = int(times_attr) if (times_attr and times_attr.isdigit()) else 2
+                start_to_pair[start] = (i, times)
+                end_to_pair[i] = (start, times)
+
+    # Kalan forward'lar eşleşmedi, yok sayılır
+    return start_to_pair, end_to_pair
+
+def expand_playback(measures: List[ET.Element]) -> List[int]:
+    """
+    Eşleştirilmiş repeat + volta ile çalım sırası (ölçü indeksleri).
+    """
     if not measures:
         return []
     ns = NS(measures[0])
-    ending_membership = parse_ending_ranges(measures, ns)
+    ending_membership = parse_endings(measures, ns)
+    start_to_pair, end_to_pair = pair_repeats(measures)
 
-    expanded: List[ET.Element] = []
+    playback: List[int] = []
     i = 0
-    frames: List[Tuple[int, Optional[int], int, int]] = []  # (start_idx, end_idx, pass_no, max_times)
+    # Stack: (start, end, pass_no, max_times)
+    frames: List[Tuple[int,int,int,int]] = []
 
-    safety_steps = 0
-    max_steps = max(20000, len(measures) * 50)  # güvenlik: orijinalin 50 katını aşma
+    raw_n = len(measures)
+    max_steps = max(2000, raw_n * 10)  # güvenlik: orijinalin 10 katını aşma
+    steps = 0
 
-    while i < len(measures):
-        safety_steps += 1
-        if safety_steps > max_steps:
-            print(f"UYARI: Repeat açılımı güvenlik sınırını aştı ({safety_steps} adım). Açılım durduruldu.", file=sys.stderr)
-            break
+    while 0 <= i < raw_n and steps < max_steps:
+        steps += 1
 
-        m = measures[i]
-
-        # Volta: geçerli pass içinde değilse bu ending bloğunu atla
+        # Volta ending: Aktif repeat varsa ve bu ölçü, geçerli pass için uygun değilse atla
         if frames:
             end_tup = ending_membership.get(i)
             if end_tup:
-                end_idx, ending_nums = end_tup
-                start_idx, _, pass_no, _ = frames[-1]
-                if ending_nums and (pass_no not in ending_nums):
+                end_idx, nums = end_tup
+                start, end_, pass_no, max_times = frames[-1]
+                if nums and (pass_no not in nums):
                     i = end_idx + 1
                     continue
 
-        expanded.append(m)
+        playback.append(i)
 
-        forward_here = False
-        backward_here = False
-        backward_times = None
+        # Eğer bu ölçü bir forward başlangıcıysa ve gerçek bir eşleşmesi varsa, iç içe repeat için çerçeve ekle
+        if i in start_to_pair:
+            end_idx, times = start_to_pair[i]
+            frames.append((i, end_idx, 1, times))
 
-        for barline in m.findall('.//' + ns.tag('barline')):
-            repeat = barline.find(ns.tag('repeat'))
-            if repeat is not None:
-                direction = repeat.get('direction')
-                if direction == 'forward':
-                    forward_here = True
-                elif direction == 'backward':
-                    backward_here = True
-                    t = repeat.get('times')
-                    if t and t.isdigit():
-                        backward_times = int(t)
-
-        if forward_here:
-            # Yeni repeat çerçevesi aç
-            frames.append((i, None, 1, backward_times or 2))  # varsayılan 2
-
-        if backward_here and frames:
-            # En son açılan çerçeveyi işlet
-            start_idx, _, pass_no, max_times = frames[-1]
-            if backward_times is not None:
-                max_times = backward_times
-            if pass_no < max_times:
-                frames[-1] = (start_idx, i, pass_no + 1, max_times)
-                i = start_idx  # tekrar başına dön
-                continue
-            else:
-                frames.pop()
+        # Eğer bu ölçü bir backward bitişiyse ve üstteki çerçeve ile eşleşiyorsa
+        if i in end_to_pair and frames:
+            start_idx, times_b = end_to_pair[i]
+            s, e, pass_no, max_times = frames[-1]
+            if s == start_idx and e == i:
+                # times uyumlaştır
+                max_times = times_b if times_b else max_times
+                if pass_no < max_times:
+                    frames[-1] = (s, e, pass_no + 1, max_times)
+                    i = s  # tekrar başına dön
+                    continue
+                else:
+                    frames.pop()
 
         i += 1
 
-    if len(expanded) > max(1, len(measures)) * 30:
-        print(f"UYARI: Repeat açılımı sıra dışı büyük: {len(measures)} -> {len(expanded)} ölçü. İşaretleri kontrol edin.", file=sys.stderr)
+    if steps >= max_steps:
+        print(f"UYARI: Playback açılımı güvenlik sınırında durduruldu ({steps} adım). Repeat işaretlerini kontrol edin.", file=sys.stderr)
 
-    return expanded
+    return playback
 
 def extract_measures(tree: ET.ElementTree, limit: Optional[int]=None) -> List[LinearMeasure]:
     root = tree.getroot()
     ns = NS(root)
     raw = collect_measures(root)
-    expanded = expand_repeats_with_volta(raw)
+    order = expand_playback(raw)
 
-    # LIMIT uygula (opsiyonel)
+    # LIMIT uygula
     if limit is not None and limit >= 0:
-        expanded = expanded[:limit]
+        order = order[:limit]
 
     linear: List[LinearMeasure] = []
     current_dynamic: Optional[str] = None
@@ -244,14 +264,14 @@ def extract_measures(tree: ET.ElementTree, limit: Optional[int]=None) -> List[Li
     global_time_beats: float = 0.0
     global_time_seconds: float = 0.0
 
-    for lin_idx, m in enumerate(expanded):
-        # Ölçü numarası
+    # Ölçü indexlerinden oluşan playback sırasını yürüt
+    for lin_idx, meas_idx in enumerate(order):
+        m = raw[meas_idx]
         no_txt = m.get('number', '0')
         try:
             meas_no = int(no_txt)
         except ValueError:
             meas_no = 0
-
         lm = LinearMeasure(linear_index=lin_idx, original_measure=meas_no)
 
         # Attributes
@@ -264,7 +284,7 @@ def extract_measures(tree: ET.ElementTree, limit: Optional[int]=None) -> List[Li
                 pass
         divisions = max(current_divisions, 1)
 
-        # Time signature (ölçü süresi doğrudan buradan alınır)
+        # Time signature -> ölçü süresi
         beats = None
         beat_type = None
         ts_el = attr.find(ns.tag('time')) if attr is not None else None
@@ -274,8 +294,33 @@ def extract_measures(tree: ET.ElementTree, limit: Optional[int]=None) -> List[Li
             if beats_txt and beats_txt.isdigit() and beat_type_txt and beat_type_txt.isdigit():
                 beats = int(beats_txt)
                 beat_type = int(beat_type_txt)
+        if beats and beat_type:
+            measure_beats = beats * (4.0 / float(beat_type))
+        else:
+            # TS yoksa içerikten tahmin
+            cur_div_pos = 0
+            max_div_pos = 0
+            for child in list(m):
+                local = child.tag.split('}', 1)[-1] if '}' in child.tag else child.tag
+                if local == 'backup':
+                    dur_txt = child.findtext(ns.tag('duration'))
+                    if dur_txt and dur_txt.isdigit():
+                        cur_div_pos = max(0, cur_div_pos - int(dur_txt))
+                elif local == 'forward':
+                    dur_txt = child.findtext(ns.tag('duration'))
+                    if dur_txt and dur_txt.isdigit():
+                        cur_div_pos += int(dur_txt)
+                        max_div_pos = max(max_div_pos, cur_div_pos)
+                elif local == 'note':
+                    dur_txt = child.findtext(ns.tag('duration'))
+                    dur_div = int(dur_txt) if (dur_txt and dur_txt.isdigit()) else 0
+                    # chord olmayan notalarda ilerle
+                    if m.find(ns.tag('chord')) is None:
+                        cur_div_pos += dur_div
+                        max_div_pos = max(max_div_pos, cur_div_pos)
+            measure_beats = max_div_pos / divisions if divisions else 0.0
 
-        # Measure başında direction (tempo/dynamic)
+        # Measure başı direction (tempo/dynamic)
         for direction in m.findall(ns.tag('direction')):
             dyn = dynamic_from_direction(direction, ns)
             if dyn:
@@ -283,34 +328,42 @@ def extract_measures(tree: ET.ElementTree, limit: Optional[int]=None) -> List[Li
                 lm.new_dynamic = dyn
             tmp = tempo_from_direction(direction, ns)
             if tmp:
-                # 10-400 BPM aralığına clamp
+                # Clamp
                 if tmp < 10.0 or tmp > 400.0:
                     print(f"UYARI: Olağan dışı tempo {tmp} BPM; clamp edildi.", file=sys.stderr)
                 current_tempo = min(max(tmp, 10.0), 400.0)
                 lm.tempo = current_tempo
 
-        # Ölçü uzunluğu (beats): Time signature varsa TS bazlı, yoksa içerikten tahmin
-        # TS varsa: beats * (4/beat_type). Yoksa: içerikteki maksimum konumdan tahmin.
+        # RH olayları: ölçü içi akışı gez
         cur_div_pos = 0
-        max_div_pos = 0
-
         def is_chord(note_el: ET.Element) -> bool:
             return note_el.find(ns.tag('chord')) is not None
 
-        # İçeriği sadece RH olaylarını toplamak ve içerik-tahmin süresini görmek için dolaş
         for child in list(m):
             local = child.tag.split('}', 1)[-1] if '}' in child.tag else child.tag
-            if local == 'backup':
+            if local == 'direction':
+                dyn = dynamic_from_direction(child, ns)
+                if dyn:
+                    current_dynamic = dyn
+                    lm.new_dynamic = dyn
+                tmp = tempo_from_direction(child, ns)
+                if tmp:
+                    if tmp < 10.0 or tmp > 400.0:
+                        print(f"UYARI: Olağan dışı tempo {tmp} BPM (ölçü içi); clamp edildi.", file=sys.stderr)
+                    current_tempo = min(max(tmp, 10.0), 400.0)
+                    lm.tempo = current_tempo
+
+            elif local == 'backup':
                 dur_txt = child.findtext(ns.tag('duration'))
                 if dur_txt and dur_txt.isdigit():
                     cur_div_pos = max(0, cur_div_pos - int(dur_txt))
+
             elif local == 'forward':
                 dur_txt = child.findtext(ns.tag('duration'))
                 if dur_txt and dur_txt.isdigit():
                     cur_div_pos += int(dur_txt)
-                    max_div_pos = max(max_div_pos, cur_div_pos)
+
             elif local == 'note':
-                # RH filtre
                 staff_txt = child.findtext(ns.tag('staff'), default='1')
                 try:
                     staff = int(staff_txt)
@@ -327,10 +380,9 @@ def extract_measures(tree: ET.ElementTree, limit: Optional[int]=None) -> List[Li
                 alter = int(child.findtext(ns.tag('pitch') + '/' + ns.tag('alter'), default='0')) if step else 0
                 octave = int(child.findtext(ns.tag('pitch') + '/' + ns.tag('octave'))) if step else 0
 
-                # RH olayı oluştur
                 if staff == 1:
-                    ev_t_beats = global_time_beats + (cur_div_pos / divisions)
-                    ev_d_beats = (dur_div / divisions)
+                    ev_t_beats = global_time_beats + (cur_div_pos / max(1, divisions))
+                    ev_d_beats = (dur_div / max(1, divisions))
                     pitches_tr: List[str] = []
                     pitches_sci: List[str] = []
                     midi: List[int] = []
@@ -359,44 +411,34 @@ def extract_measures(tree: ET.ElementTree, limit: Optional[int]=None) -> List[Li
                         slur_start=slur_start, slur_end=slur_end, grace=grace
                     ))
 
-                # chord değilse pozisyonu ilerlet
                 if not chord_flag:
                     cur_div_pos += dur_div
-                    max_div_pos = max(max_div_pos, cur_div_pos)
 
-        # Ölçü süresi (beats):
-        if beats and beat_type:
-            measure_beats = beats * (4.0 / float(beat_type))
-        else:
-            measure_beats = max_div_pos / divisions if divisions else 0.0
-
-        # Ölçü başı tempo ile saniyeye çevir
+        # Zamanı saniyeye çevir ve global zamanda ilerle
         sec_per_beat = 60.0 / max(current_tempo, 1e-6)
         for ev in lm.RH:
             local_offset = ev.t_beats - global_time_beats
             ev.t_seconds = global_time_seconds + local_offset * sec_per_beat
             ev.dur_seconds = ev.dur_beats * sec_per_beat
 
-        # Global zamanı ilerlet
         global_time_seconds += measure_beats * sec_per_beat
         global_time_beats += measure_beats
         lm.measure_beats = measure_beats
 
         linear.append(lm)
 
-    # Toplam info
-    print(f"[INFO] Expanded measures: {len(expanded)} (raw: {len(raw)})", file=sys.stderr)
+    # Bilgi
+    print(f"[INFO] Raw measures: {len(raw)}", file=sys.stderr)
+    print(f"[INFO] Expanded playback length: {len(order)}", file=sys.stderr)
     print(f"[INFO] Total duration (s): {global_time_seconds:.3f}", file=sys.stderr)
-
-    # Aşırı uzun süre uyarısı
-    if len(raw) > 0 and global_time_seconds > 3600:  # 1 saatten uzun ise uyar
-        print(f"UYARI: Toplam süre olağan dışı uzun görünüyor ({global_time_seconds:.1f} s). Repeat işaretlerini ve tempo/metronomu kontrol edin.", file=sys.stderr)
+    if len(order) > len(raw) * 10:
+        print(f"UYARI: Playback açılımı sıra dışı uzun: {len(raw)} -> {len(order)}. İşaretleri kontrol edin.", file=sys.stderr)
 
     return linear
 
 def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
     out_dir.mkdir(parents=True, exist_ok=True)
-    now = datetime.datetime.utcnow().isoformat()
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
     events = []
     for m in measures:
@@ -419,16 +461,17 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
 
     # TXT
     txt = [
-        "MusicXML Transcript (RH only, repeat+volta expanded, TS-based measure length)",
+        "MusicXML Sağ El Transcript (RH only, paired repeat+volta, TS-based)",
         f"Generated UTC: {now}",
         f"Linear measures: {len(measures)}",
         f"Events: {len(events)}",
+        f"Script version: {__VERSION__}",
         "---",
         "time_sec\tdur_sec\tpitches_sci\tdyn\tart"
     ]
     for e in events:
         txt.append(f"{e['t']:.3f}\t{e['dur']:.3f}\t{','.join(e['pitches_sci']) or 'rest'}\t{e['dyn'] or ''}\t{','.join(e['art'])}")
-    (out_dir/"transcript_full.txt").write_text("\n".join(txt), encoding="utf-8")
+    (out_dir/"transcript_rh.txt").write_text("\n".join(txt), encoding="utf-8")
 
     # JSON
     json_obj = {
@@ -436,16 +479,16 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
             'generated_utc': now,
             'measure_count': len(measures),
             'event_count': len(events),
-            'format_version': 8,
+            'format_version': 9,
             'script_version': __VERSION__,
         },
         'events': events
     }
-    (out_dir/"transcript_full.json").write_text(json.dumps(json_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir/"transcript_rh.json").write_text(json.dumps(json_obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # ABC placeholder
     abc_lines = ["X:1", "T:Extracted RH", "M:4/4", "L:1/16", "Q:1/4=120", "K:C", "V:1 clef=treble"]
-    (out_dir/"transcript_full.abc").write_text("\n".join(abc_lines), encoding="utf-8")
+    (out_dir/"transcript_rh.abc").write_text("\n".join(abc_lines), encoding="utf-8")
 
     # Measure map
     map_lines = ["# Measure Map", "",
@@ -453,9 +496,9 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
                  "|------------:|---------------:|----------:|-------------:|"]
     for m in measures:
         map_lines.append(f"| {m.linear_index} | {m.original_measure} | {len(m.RH)} | {m.measure_beats:.3f} |")
-    (out_dir/"measure_map.md").write_text("\n".join(map_lines), encoding="utf-8")
+    (out_dir/"measure_map_rh.md").write_text("\n".join(map_lines), encoding="utf-8")
 
-    # Lua exporter
+    # Lua
     def lua_list(values):
         if not values:
             return "{}"
@@ -468,7 +511,7 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
         return "{" + ",".join(formatted) + "}"
 
     lua_lines = [
-        "-- Auto-generated RH transcription table (repeat+volta expanded, TS-based measure length)",
+        "-- Auto-generated RH transcription table (paired repeat+volta, TS-based)",
         f"-- Generated UTC: {now}",
         f"-- Script version: {__VERSION__}",
         "return {",
@@ -497,7 +540,7 @@ def write_outputs(measures: List[LinearMeasure], out_dir: pathlib.Path):
         )
     lua_lines.append("  }")
     lua_lines.append("}")
-    (out_dir/"transcript_full.lua").write_text("\n".join(lua_lines), encoding="utf-8")
+    (out_dir/"transcript_rh.lua").write_text("\n".join(lua_lines), encoding="utf-8")
 
     print(f"Wrote {len(events)} RH events across {len(measures)} measures.")
 
@@ -517,7 +560,7 @@ def main():
     if len(sys.argv) < 2:
         print("USAGE: python scripts/generate_transcript.py <input.musicxml> [LIMIT]\n"
               "LIMIT = all/-1 (tümü) veya pozitif sayı (ilk N ölçü)\n"
-              "Çıktılar: transcript_full.txt, .json, .lua, .abc, .md\n", file=sys.stderr)
+              "Çıktılar: transcript_rh.txt, .json, .lua, .abc, .md\n", file=sys.stderr)
         sys.exit(1)
     path = pathlib.Path(sys.argv[1])
     if not path.exists():
